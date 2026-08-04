@@ -12,8 +12,12 @@
   "type": "commonjs",
   "dependencies": {
     "cors": "^2.8.5",
+    "dotenv": "^17.4.2",
     "express": "^5.1.0",
+    "mongoose": "^9.6.1",
     "ws": "^8.18.3",
-    "y-websocket": "^1.4.5"
+    "y-mongodb-provider": "^0.2.1",
+    "y-websocket": "^1.4.5",
+    "yjs": "^13.6.30"
   }
 }
