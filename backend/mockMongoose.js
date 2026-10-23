@@ -2,7 +2,10 @@
 const fs = require('fs');
 const path = require('path');
 
-const dbPath = path.join(__dirname, 'db.json');
+// Tests may redirect persistence to a temporary directory. Normal runs keep
+// using the backend directory unless this environment variable is set.
+const dataDir = process.env.CODESTUDIO_DATA_DIR || __dirname;
+const dbPath = path.join(dataDir, 'db.json');
 
 function loadDB() {
   if (!fs.existsSync(dbPath)) {
