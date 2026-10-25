@@ -6,12 +6,23 @@ export default function EditorToolbar({
   openPalette,
   outputOpen,
   setOutputOpen,
+  roomStatus,
   persistedRevision,
   executionUnavailableReason,
 }) {
+  const saveStatus = !activeFile
+    ? 'No document selected'
+    : roomStatus === 'unavailable'
+      ? 'History unavailable · editing blocked'
+      : persistedRevision
+        ? `Saved · revision ${persistedRevision.revisionId.slice(0, 15)}…`
+        : roomStatus === 'connected'
+          ? 'Awaiting durable save confirmation'
+          : 'Read-only until synchronized';
+
   return (
     <div className="editor-toolbar" role="toolbar" aria-label="Editor actions">
-      <span>{activeFile ? `${languageLabel} · ${activeFile}` : 'No active document'}</span>
+      <span className="editor-toolbar-context">{activeFile ? `${languageLabel} · ${activeFile}` : 'No active document'}</span>
       <div className="editor-toolbar-actions">
         <button type="button" className="toolbar-action" onClick={() => openPalette('files')} aria-label="Open file" title="Open file (Ctrl/⌘ P)">
           <Search size={14} /><span>Open</span>
@@ -47,11 +58,8 @@ export default function EditorToolbar({
         </button>
       </div>
       <div className="execution-details">
-        <span className="execution-status" role="status">
-          {persistedRevision
-            ? `Revision ${persistedRevision.revisionId.slice(0, 15)}… confirmed. ${executionUnavailableReason}`
-            : executionUnavailableReason}
-        </span>
+        <span className={`revision-status ${persistedRevision ? 'confirmed' : ''}`} role="status">{saveStatus}</span>
+        <span className="execution-status" title={executionUnavailableReason}>Execution disabled</span>
         <span id="execution-disabled-reason" className="visually-hidden">{executionUnavailableReason}</span>
       </div>
     </div>

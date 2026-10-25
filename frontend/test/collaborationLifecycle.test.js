@@ -6,11 +6,13 @@ import {
   getRoomUiState,
   isUnavailableRoomClose,
 } from '../src/collaborationLifecycle.js';
+import { getPresenceParticipants } from '../src/collaboratorPresence.js';
 
-function makeSession({ isCurrent = () => true, onUnavailable = () => {}, onStatus = () => {} } = {}) {
+function makeSession({ isCurrent = () => true, onUnavailable = () => {}, onStatus = () => {}, onAwarenessChange = () => {} } = {}) {
   const calls = { binding: 0, provider: 0, doc: 0, style: 0, awarenessNull: 0, unavailable: 0, status: [] };
   const provider = new EventEmitter();
   provider.awareness = new EventEmitter();
+  provider.awareness.clientID = 1;
   provider.awareness.setLocalState = state => {
     if (state === null) calls.awarenessNull += 1;
   };
@@ -24,11 +26,38 @@ function makeSession({ isCurrent = () => true, onUnavailable = () => {}, onStatu
     ydoc,
     cursorStyle,
     isCurrent,
+    onAwarenessChange,
     onUnavailable: () => { calls.unavailable += 1; onUnavailable(); },
     onStatus: status => { calls.status.push(status); onStatus(status); },
   });
   return { calls, provider, session };
 }
+
+test('awareness changes update join and leave snapshots and stop after session cleanup', () => {
+  let states = new Map([[1, { user: { name: 'Local' } }]]);
+  let latestParticipants = [];
+  const { provider, session } = makeSession({
+    onAwarenessChange: () => {
+      latestParticipants = getPresenceParticipants(states, provider.awareness.clientID);
+    },
+  });
+
+  provider.awareness.emit('change');
+  assert.deepEqual(latestParticipants.map(person => person.name), ['Local']);
+
+  states = new Map([...states, [2, { user: { name: 'Remote' } }]]);
+  provider.awareness.emit('change');
+  assert.deepEqual(latestParticipants.map(person => person.name), ['Local', 'Remote']);
+
+  states.delete(2);
+  provider.awareness.emit('change');
+  assert.deepEqual(latestParticipants.map(person => person.name), ['Local']);
+
+  session.dispose();
+  states = new Map([[3, { user: { name: 'Late participant' } }]]);
+  provider.awareness.emit('change');
+  assert.deepEqual(latestParticipants.map(person => person.name), ['Local']);
+});
 
 test('explicit unavailable-room rejection immediately disposes every session resource', () => {
   const { calls, provider, session } = makeSession();

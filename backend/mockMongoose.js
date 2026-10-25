@@ -9,12 +9,16 @@ const dbPath = path.join(dataDir, 'db.json');
 
 function loadDB() {
   if (!fs.existsSync(dbPath)) {
-    fs.writeFileSync(dbPath, JSON.stringify({ files: [], members: [] }, null, 2));
+    fs.writeFileSync(dbPath, JSON.stringify({ files: [], members: [], folders: [] }, null, 2));
   }
   try {
-    return JSON.parse(fs.readFileSync(dbPath, 'utf8'));
+    const db = JSON.parse(fs.readFileSync(dbPath, 'utf8'));
+    for (const collection of ['files', 'members', 'folders']) {
+      if (!Array.isArray(db[collection])) db[collection] = [];
+    }
+    return db;
   } catch (e) {
-    return { files: [], members: [] };
+    return { files: [], members: [], folders: [] };
   }
 }
 

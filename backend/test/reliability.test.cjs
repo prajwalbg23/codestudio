@@ -296,6 +296,154 @@ test('file and member APIs list, create, retrieve, reject invalid/duplicate data
   assert.deepEqual(await deleteMember.json(), { message: 'Member deleted successfully' });
 });
 
+test('file creation detects the six supported languages, case-insensitively, and honors valid metadata', async () => {
+  const cases = [
+    ['LanguageJava.java', 'java'],
+    ['LanguageC.c', 'c'],
+    ['LanguagePython.py', 'python'],
+    ['LanguageHtml.html', 'html'],
+    ['LanguageHtmlAlias.htm', 'html'],
+    ['LanguageCss.css', 'css'],
+    ['LanguageJs.js', 'javascript'],
+    ['LanguageJsx.jsx', 'javascript'],
+    ['LanguageMjs.mjs', 'javascript'],
+    ['LanguageCjs.cjs', 'javascript'],
+    ['LanguageUpper.JAVA', 'java'],
+    ['LanguageUpper.C', 'c'],
+    ['LanguageUpper.PY', 'python'],
+    ['LanguageUpper.HTM', 'html'],
+    ['LanguageUpper.CSS', 'css'],
+    ['LanguageUpper.JSX', 'javascript'],
+  ];
+
+  for (const [name, expectedLanguage] of cases) {
+    const response = await request(`http://127.0.0.1:${port}/api/files`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name }),
+    });
+    assert.equal(response.status, 200, name);
+    assert.equal((await response.json()).file.language, expectedLanguage, name);
+  }
+
+  const explicit = await request(`http://127.0.0.1:${port}/api/files`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ name: 'ExplicitLanguage.java', language: 'python' }),
+  });
+  const explicitFile = (await explicit.json()).file;
+  assert.equal(explicitFile.language, 'python');
+  assert.equal(explicitFile.languageSource, 'explicit');
+
+  const invalid = await request(`http://127.0.0.1:${port}/api/files`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ name: 'InvalidMetadata.PY', language: 'not-a-language' }),
+  });
+  assert.equal((await invalid.json()).file.language, 'python');
+
+  const uppercaseMetadata = await request(`http://127.0.0.1:${port}/api/files`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ name: 'ExplicitMetadata.py', language: 'Java' }),
+  });
+  assert.equal((await uppercaseMetadata.json()).file.language, 'Java');
+
+  const explicitJavaScript = await request(`http://127.0.0.1:${port}/api/files`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ name: 'ExplicitJavaScript.py', language: 'javascript' }),
+  });
+  assert.equal((await explicitJavaScript.json()).file.language, 'javascript');
+});
+
+test('legacy default JavaScript metadata is inferred from extension without rewriting stored records', async () => {
+  const dbPath = path.join(dataDir, 'db.json');
+  const originalBytes = fs.readFileSync(dbPath);
+  const db = JSON.parse(originalBytes.toString('utf8'));
+  db.files.push({ _id: 'legacy-language-record', name: 'legacy-language.py', language: 'javascript' });
+  const seededBytes = Buffer.from(JSON.stringify(db, null, 2));
+  fs.writeFileSync(dbPath, seededBytes);
+
+  const response = await request(`http://127.0.0.1:${port}/api/files/legacy-language.py`);
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { language: 'python' });
+  assert.deepEqual(fs.readFileSync(dbPath), seededBytes);
+});
+
+test('folders and nested files validate paths, reject collisions, and keep room revisions stable after restart', async () => {
+  const api = `http://127.0.0.1:${port}/api`;
+  const createFolder = path => request(`${api}/folders`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ path }),
+  });
+  const createFile = name => request(`${api}/files`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name }),
+  });
+
+  for (const invalidPath of ['', '/absolute', '../escape.js', 'src/../escape.js', 'src//empty.py', './file.js', 'C:/outside.js', 'src\\file.py', 'trailing.']) {
+    const invalidFile = await createFile(invalidPath);
+    assert.equal(invalidFile.status, 400, `reject file path ${JSON.stringify(invalidPath)}`);
+    if (invalidPath === '') assert.deepEqual(await invalidFile.json(), { error: 'Name is required' });
+    const invalidFolder = await createFolder(invalidPath);
+    assert.equal(invalidFolder.status, 400, `reject folder path ${JSON.stringify(invalidPath)}`);
+  }
+
+  const topFolder = await createFolder('milestone-3b');
+  assert.equal(topFolder.status, 200);
+  const nestedFolder = await createFolder('milestone-3b/src');
+  assert.equal(nestedFolder.status, 200);
+  assert.equal((await createFolder('milestone-3b/empty')).status, 200);
+  assert.equal((await createFolder('milestone-3b/src')).status, 400);
+  assert.equal((await createFolder('milestone-3b/missing/child')).status, 400);
+
+  const room = 'milestone-3b/src/Main.JAVA';
+  const nestedFile = await createFile(room);
+  assert.equal(nestedFile.status, 200);
+  assert.equal((await nestedFile.json()).file.language, 'java');
+  assert.equal((await createFile(room)).status, 400);
+  assert.equal((await createFile('milestone-3b/missing/file.js')).status, 400);
+  assert.equal((await createFile('milestone-3b/src')).status, 400, 'a file cannot replace a folder');
+  assert.equal((await createFolder(room)).status, 400, 'a folder cannot replace a file');
+
+  const blockedParent = await createFile('blocked-parent');
+  assert.equal(blockedParent.status, 200);
+  assert.equal((await createFolder('blocked-parent/child')).status, 400);
+  assert.equal((await createFile('blocked-parent/child.js')).status, 400);
+
+  const concurrentPath = 'milestone-3b/src/single-create.c';
+  const concurrentCreates = await Promise.all([createFile(concurrentPath), createFile(concurrentPath)]);
+  assert.deepEqual(concurrentCreates.map(response => response.status).sort(), [200, 400]);
+
+  const foldersBeforeRestart = await request(`${api}/folders`);
+  assert.deepEqual(await foldersBeforeRestart.json(), ['milestone-3b', 'milestone-3b/empty', 'milestone-3b/src']);
+  const filesBeforeRestart = await request(`${api}/files`);
+  assert.ok((await filesBeforeRestart.json()).includes(room));
+
+  const { doc, provider } = createProvider(room);
+  const { doc: observer, provider: observerProvider } = createProvider(room);
+  await Promise.all([waitForSync(provider), waitForSync(observerProvider)]);
+  doc.getText('monaco').insert(0, 'nested room survives');
+  await waitForText(observer, 'nested room survives');
+
+  const encodedRoom = encodeURIComponent(room);
+  const latestBeforeRestart = await request(`${api}/files/${encodedRoom}/revisions/latest`);
+  assert.equal(latestBeforeRestart.status, 200);
+  const revision = await latestBeforeRestart.json();
+  assert.equal(revision.sourceHash, crypto.createHash('sha256').update('nested room survives').digest('hex'));
+
+  await closeProviders();
+  await stopServer();
+  await startServer();
+
+  const foldersAfterRestart = await request(`${api}/folders`);
+  assert.deepEqual(await foldersAfterRestart.json(), ['milestone-3b', 'milestone-3b/empty', 'milestone-3b/src']);
+  const filesAfterRestart = await request(`${api}/files`);
+  assert.ok((await filesAfterRestart.json()).includes(room));
+  const metadataAfterRestart = await request(`${api}/files/${encodedRoom}`);
+  assert.equal(metadataAfterRestart.status, 200);
+  assert.deepEqual(await metadataAfterRestart.json(), { language: 'java' });
+  const latestAfterRestart = await request(`${api}/files/${encodedRoom}/revisions/latest`);
+  assert.equal(latestAfterRestart.status, 200);
+  assert.deepEqual(await latestAfterRestart.json(), revision);
+  const specificRevision = await request(`${api}/files/${encodedRoom}/revisions/${revision.revisionId}`);
+  assert.equal(specificRevision.status, 200);
+  assert.deepEqual(await specificRevision.json(), revision);
+});
+
 test('HTTP API accepts only configured browser origins', async () => {
   const url = `http://127.0.0.1:${port}/api/files`;
   const allowed = await request(url, { headers: { Origin: 'http://localhost:5173' } });

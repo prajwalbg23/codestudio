@@ -8,6 +8,8 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { handleWorkspaceShortcut } from '../src/workspaceInteractions.js';
 import { getRoomUiState } from '../src/collaborationLifecycle.js';
+import { getPresenceParticipants, getVisiblePresenceParticipants } from '../src/collaboratorPresence.js';
+import { buildProjectTree } from '../src/projectTree.js';
 
 const frontendRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const dom = new JSDOM('<!doctype html><html><body></body></html>', { url: 'http://localhost/' });
@@ -26,6 +28,8 @@ let vite;
 let CommandPalette;
 let EditorToolbar;
 let OutputPanel;
+let CollaboratorPresence;
+let ProjectTree;
 
 before(async () => {
   vite = await createServer({
@@ -39,6 +43,8 @@ before(async () => {
   ({ default: CommandPalette } = await vite.ssrLoadModule('/src/components/CommandPalette.jsx'));
   ({ default: EditorToolbar } = await vite.ssrLoadModule('/src/components/EditorToolbar.jsx'));
   ({ default: OutputPanel } = await vite.ssrLoadModule('/src/components/OutputPanel.jsx'));
+  ({ default: CollaboratorPresence } = await vite.ssrLoadModule('/src/components/CollaboratorPresence.jsx'));
+  ({ default: ProjectTree } = await vite.ssrLoadModule('/src/components/ProjectTree.jsx'));
 });
 
 after(async () => {
@@ -53,6 +59,9 @@ function mount(element) {
   act(() => root.render(element));
   return {
     container,
+    rerender(element) {
+      act(() => root.render(element));
+    },
     unmount() {
       act(() => root.unmount());
       container.remove();
@@ -347,7 +356,8 @@ test('execution controls stay disabled without verified isolation and explain th
     assert.equal(run.disabled, true);
     assert.equal(stop.disabled, true);
     assert.equal(run.title, reason);
-    assert.match(mounted.container.querySelector('.execution-status').textContent, /isolation runtime can be verified/i);
+    assert.match(mounted.container.querySelector('.execution-status').getAttribute('title'), /isolation runtime can be verified/i);
+    assert.match(mounted.container.querySelector('.revision-status').textContent, /read-only|save confirmation/i);
     assert.match(mounted.container.textContent, /isolation runtime can be verified/i);
   } finally {
     mounted.unmount();
@@ -439,4 +449,113 @@ test('connection and synchronization statuses remain distinct and unsafe history
   assert.equal(unavailable.status, 'unavailable');
   assert.equal(unavailable.editorReadOnly, true);
   assert.equal(unavailable.showCollaborators, false);
+});
+
+test('presence renders the local participant distinctly and updates as collaborators join and leave', () => {
+  const local = { name: 'Alex', color: '#336699', clientId: 12, isCurrentSession: true };
+  const firstRemote = { name: 'Alex', color: '#aa6644', clientId: 13, isCurrentSession: false };
+  const secondRemote = { name: 'Sam', color: '#448866', clientId: 14, isCurrentSession: false };
+  const thirdRemote = { name: 'Alex', color: '#8866aa', clientId: 15, isCurrentSession: false };
+  const renderPresence = participants => React.createElement(CollaboratorPresence, {
+    participants: getVisiblePresenceParticipants(participants, 'connected'),
+    connectionStatus: 'connected',
+  });
+  const mounted = mount(renderPresence([local]));
+
+  try {
+    assert.match(mounted.container.textContent, /You · Alex/);
+    assert.match(mounted.container.textContent, /No other collaborators connected/);
+
+    mounted.rerender(renderPresence([local, firstRemote, secondRemote, thirdRemote]));
+    assert.match(mounted.container.textContent, /You · Alex/);
+    assert.match(mounted.container.textContent, /Alex · 1/);
+    assert.match(mounted.container.textContent, /Alex · 2/);
+    assert.match(mounted.container.textContent, /Sam/);
+
+    mounted.rerender(renderPresence([local, secondRemote]));
+    assert.doesNotMatch(mounted.container.textContent, /Alex · 1/);
+    assert.doesNotMatch(mounted.container.textContent, /Alex · 2/);
+    assert.match(mounted.container.textContent, /Sam/);
+  } finally {
+    mounted.unmount();
+  }
+});
+
+test('presence hides stale participants across connection transitions and handles missing identity data', () => {
+  const awareness = new Map([
+    [3, { user: { name: 'Current', color: '#123456' } }],
+    [4, { user: { name: 'Remote', color: '#abcdef' } }],
+    [5, { user: { name: '   ' } }],
+    [6, { user: {} }],
+  ]);
+  const participants = getPresenceParticipants(awareness, 3);
+  assert.deepEqual(participants.map(({ name, isCurrentSession }) => [name, isCurrentSession]), [
+    ['Current', true], ['Remote', false],
+  ]);
+
+  const connected = getVisiblePresenceParticipants(participants, 'connected');
+  const mounted = mount(React.createElement(CollaboratorPresence, {
+    participants: connected,
+    connectionStatus: 'connected',
+  }));
+  try {
+    assert.match(mounted.container.textContent, /Remote/);
+    for (const status of ['connecting', 'synchronizing', 'reconnecting', 'disconnected']) {
+      mounted.rerender(React.createElement(CollaboratorPresence, {
+        participants: getVisiblePresenceParticipants(participants, status),
+        connectionStatus: status,
+      }));
+      assert.doesNotMatch(mounted.container.textContent, /Remote/);
+      assert.match(mounted.container.textContent, /Presence appears after synchronization/);
+    }
+  } finally {
+    mounted.unmount();
+  }
+});
+
+test('project tree folders expand and collapse, select a target folder, and open nested files', () => {
+  const tree = buildProjectTree(['root.js', 'src/main.py'], ['src', 'src/empty']);
+  const FileIcon = ({ name }) => React.createElement('span', { 'aria-hidden': 'true' }, name.split('/').at(-1));
+
+  function Harness() {
+    const [expandedFolders, setExpandedFolders] = useState(new Set());
+    const [selectedFolder, setSelectedFolder] = useState('');
+    const [activeFile, setActiveFile] = useState('');
+    return React.createElement(ProjectTree, {
+      tree, activeFile, selectedFolder, expandedFolders, FileIcon,
+      onSelectFolder: path => {
+        setSelectedFolder(path);
+        setExpandedFolders(current => {
+          const next = new Set(current);
+          if (next.has(path)) next.delete(path);
+          else next.add(path);
+          return next;
+        });
+      },
+      onOpenFile: setActiveFile,
+      onDeleteFile: () => {},
+    });
+  }
+
+  const mounted = mount(React.createElement(Harness));
+  try {
+    assert.equal(mounted.container.querySelector('[aria-current="page"]'), null);
+    assert.equal(mounted.container.querySelector('.project-file-button span')?.textContent, 'root.js');
+    assert.equal(mounted.container.textContent.includes('main.py'), false);
+
+    act(() => mounted.container.querySelector('[aria-label="Expand and select folder src"]').click());
+    const folderButton = mounted.container.querySelector('[aria-label="Collapse and select folder src"]');
+    assert.equal(folderButton.getAttribute('aria-expanded'), 'true');
+    assert.equal(folderButton.getAttribute('aria-pressed'), 'true');
+    const nestedFile = [...mounted.container.querySelectorAll('.project-file-button')]
+      .find(button => button.textContent.includes('main.py'));
+    assert.ok(nestedFile);
+    act(() => nestedFile.click());
+    assert.equal(nestedFile.getAttribute('aria-current'), 'page');
+
+    act(() => folderButton.click());
+    assert.equal(mounted.container.textContent.includes('main.py'), false);
+  } finally {
+    mounted.unmount();
+  }
 });

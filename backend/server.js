@@ -17,15 +17,69 @@ const yUtils = require('y-websocket/bin/utils');
 const Y = require('yjs');
 const mongoose = require('mongoose');
 const File = require('./models/File');
+const Folder = require('./models/Folder');
 const Member = require('./models/Member');
 const { createYjsPersistence } = require('./yjsPersistence');
 const { searchText: searchProjectText, DEFAULT_RESULT_LIMIT } = require('./projectSearch');
 const { BACKEND_BIND_HOST, isAllowedFrontendOrigin } = require('./networkBoundary');
+const { isValidProjectPath, parentProjectPath, projectPathAncestors } = require('./projectPaths');
 
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 const EXECUTION_UNAVAILABLE_REASON = 'JavaScript execution is disabled because a verified local isolation runtime is unavailable.';
+let projectMutationQueue = Promise.resolve();
+
+function queueProjectMutation(mutation) {
+  const operation = projectMutationQueue.then(mutation, mutation);
+  projectMutationQueue = operation.catch(() => {});
+  return operation;
+}
+const SUPPORTED_FILE_LANGUAGES = new Set([
+  'javascript', 'typescript', 'python', 'java', 'c', 'cpp', 'html', 'css', 'json', 'markdown',
+  'scss', 'less', 'csharp', 'go', 'rust', 'yaml', 'xml', 'sql', 'shell', 'plaintext',
+  'js', 'jsx', 'mjs', 'cjs', 'ts', 'tsx', 'py', 'sh', 'yml', 'md',
+]);
+const LANGUAGE_BY_EXTENSION = {
+  java: 'java',
+  c: 'c',
+  py: 'python',
+  html: 'html',
+  htm: 'html',
+  css: 'css',
+  js: 'javascript',
+  jsx: 'javascript',
+  mjs: 'javascript',
+  cjs: 'javascript',
+  json: 'json',
+  md: 'markdown',
+};
+
+function isSupportedFileLanguage(language) {
+  return typeof language === 'string'
+    && SUPPORTED_FILE_LANGUAGES.has(language.trim().toLowerCase());
+}
+
+function getFileLanguage(name, requestedLanguage) {
+  if (isSupportedFileLanguage(requestedLanguage)) {
+    return { language: requestedLanguage, languageSource: 'explicit' };
+  }
+  const extension = String(name).split('.').pop()?.toLowerCase() || '';
+  return {
+    language: LANGUAGE_BY_EXTENSION[extension] || 'javascript',
+    languageSource: 'extension',
+  };
+}
+
+function languageForExistingFile(file) {
+  if (isSupportedFileLanguage(file.language)) {
+    if (file.languageSource === 'explicit' || file.languageSource === 'extension') return file.language;
+    // Before languageSource was recorded, the backend defaulted unknown extensions
+    // to JavaScript. Infer those legacy defaults without rewriting stored records.
+    if (file.language.trim().toLowerCase() !== 'javascript') return file.language;
+  }
+  return getFileLanguage(file.name).language;
+}
 
 // Browsers can call the local API only from the project's default Vite dev/preview
 // origins. Requests without Origin remain available for local command-line tools.
@@ -88,6 +142,15 @@ app.get('/api/files', async (req, res) => {
   }
 });
 
+app.get('/api/folders', async (req, res) => {
+  try {
+    const folders = await Folder.find({});
+    res.json(folders.map(folder => folder.path).sort((a, b) => a.localeCompare(b)));
+  } catch {
+    res.status(500).json({ error: 'Failed to fetch folders' });
+  }
+});
+
 app.get('/api/execution-capability', (req, res) => {
   res.json({ available: false, reason: EXECUTION_UNAVAILABLE_REASON });
 });
@@ -99,6 +162,9 @@ app.post('/api/executions', (req, res) => {
 
 app.get('/api/files/:filename/revisions/latest', async (req, res) => {
   try {
+    if (!isValidProjectPath(req.params.filename)) {
+      return res.status(400).json({ error: 'Invalid project-relative file path' });
+    }
     const file = await File.findOne({ name: req.params.filename });
     if (!file) return res.status(404).json({ error: 'File not found' });
     const revision = yjsPersistence.readDocumentRevision(file.name);
@@ -119,6 +185,9 @@ app.get('/api/files/:filename/revisions/:revisionId', async (req, res) => {
     if (!/^yrev1_[a-f0-9]{64}$/.test(req.params.revisionId)) {
       return res.status(400).json({ error: 'Invalid document revision identifier' });
     }
+    if (!isValidProjectPath(req.params.filename)) {
+      return res.status(400).json({ error: 'Invalid project-relative file path' });
+    }
     const file = await File.findOne({ name: req.params.filename });
     if (!file) return res.status(404).json({ error: 'File not found' });
     const revision = yjsPersistence.readDocumentRevision(file.name, req.params.revisionId);
@@ -136,11 +205,14 @@ app.get('/api/files/:filename/revisions/:revisionId', async (req, res) => {
 
 app.get('/api/files/:filename', async (req, res) => {
   try {
+    if (!isValidProjectPath(req.params.filename)) {
+      return res.status(400).json({ error: 'Invalid project-relative file path' });
+    }
     const file = await File.findOne({ name: req.params.filename });
     if (!file) {
       return res.status(404).json({ error: 'File not found' });
     }
-    res.json({ language: file.language });
+    res.json({ language: languageForExistingFile(file) });
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch file' });
   }
@@ -151,7 +223,7 @@ app.post('/api/search', async (req, res) => {
   if (typeof query !== 'string' || !query.trim() || query.trim().length > 200
     || typeof caseSensitive !== 'boolean' || typeof wholeWord !== 'boolean'
     || (excludeFileName !== undefined
-      && (typeof excludeFileName !== 'string' || excludeFileName.length > 255))) {
+      && (!isValidProjectPath(excludeFileName) || excludeFileName.length > 255))) {
     return res.status(400).json({ error: 'Invalid project search request' });
   }
 
@@ -184,35 +256,77 @@ app.post('/api/search', async (req, res) => {
 
 app.post('/api/files', async (req, res) => {
   try {
-    const { name, language } = req.body;
-    if (!name) return res.status(400).json({ error: 'Name is required' });
-    const existing = await File.findOne({ name });
-    if (existing) return res.status(400).json({ error: 'File already exists' });
-    
-    // Auto-detect language if not provided
-    let extLanguage = 'javascript';
-    if (language) {
-      extLanguage = language;
-    } else if (name.endsWith('.html')) {
-      extLanguage = 'html';
-    } else if (name.endsWith('.css')) {
-      extLanguage = 'css';
-    } else if (name.endsWith('.json')) {
-      extLanguage = 'json';
-    } else if (name.endsWith('.md')) {
-      extLanguage = 'markdown';
-    }
+    await queueProjectMutation(async () => {
+      const { name, language } = req.body || {};
+      if (!name) return res.status(400).json({ error: 'Name is required' });
+      if (!isValidProjectPath(name)) {
+        return res.status(400).json({ error: 'Invalid project-relative file path' });
+      }
 
-    const newFile = new File({ name, language: extLanguage });
-    await newFile.save();
-    res.json({ message: 'File created successfully', file: newFile });
+      const [files, folders] = await Promise.all([File.find({}), Folder.find({})]);
+      if (files.some(file => file.name === name)) return res.status(400).json({ error: 'File already exists' });
+      if (folders.some(folder => folder.path === name || folder.path.startsWith(`${name}/`))) {
+        return res.status(400).json({ error: 'A folder already exists at or below this path' });
+      }
+
+      const ancestors = projectPathAncestors(name);
+      if (ancestors.some(ancestor => files.some(file => file.name === ancestor))) {
+        return res.status(400).json({ error: 'A file blocks this project path' });
+      }
+      const parentPath = parentProjectPath(name);
+      if (parentPath && !folders.some(folder => folder.path === parentPath)) {
+        return res.status(400).json({ error: 'Parent folder does not exist' });
+      }
+
+      const languageMetadata = getFileLanguage(name, language);
+      const newFile = new File({ name, ...languageMetadata });
+      await newFile.save();
+      return res.json({ message: 'File created successfully', file: newFile });
+    });
   } catch (error) {
     res.status(500).json({ error: 'Failed to create file' });
   }
 });
 
+app.post('/api/folders', async (req, res) => {
+  try {
+    await queueProjectMutation(async () => {
+      const folderPath = req.body?.path;
+      if (!isValidProjectPath(folderPath)) {
+        return res.status(400).json({ error: 'Invalid project-relative folder path' });
+      }
+
+      const [files, folders] = await Promise.all([File.find({}), Folder.find({})]);
+      if (folders.some(folder => folder.path === folderPath)) {
+        return res.status(400).json({ error: 'Folder already exists' });
+      }
+      if (files.some(file => file.name === folderPath)) {
+        return res.status(400).json({ error: 'A file already exists at this path' });
+      }
+
+      const ancestors = projectPathAncestors(folderPath);
+      if (ancestors.some(ancestor => files.some(file => file.name === ancestor))) {
+        return res.status(400).json({ error: 'A file blocks this project path' });
+      }
+      const parentPath = parentProjectPath(folderPath);
+      if (parentPath && !folders.some(folder => folder.path === parentPath)) {
+        return res.status(400).json({ error: 'Parent folder does not exist' });
+      }
+
+      const folder = new Folder({ path: folderPath });
+      await folder.save();
+      return res.json({ message: 'Folder created successfully', folder });
+    });
+  } catch {
+    res.status(500).json({ error: 'Failed to create folder' });
+  }
+});
+
 app.delete('/api/files/:filename', async (req, res) => {
   try {
+    if (!isValidProjectPath(req.params.filename)) {
+      return res.status(400).json({ error: 'Invalid project-relative file path' });
+    }
     const deleted = await File.findOneAndDelete({ name: req.params.filename });
     if (!deleted) return res.status(404).json({ error: 'File not found' });
     res.json({ message: 'File deleted successfully' });

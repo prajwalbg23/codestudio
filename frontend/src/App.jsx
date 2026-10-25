@@ -11,10 +11,10 @@ import {
   Plus,
   Trash2,
   FolderCode,
+  FolderPlus,
   Users,
   UserPlus,
   Files,
-  User,
   Search,
   Menu,
   X,
@@ -22,10 +22,16 @@ import {
   ChevronUp,
 } from 'lucide-react';
 import CommandPalette from './components/CommandPalette.jsx';
+import CollaboratorPresence from './components/CollaboratorPresence.jsx';
+import ProjectTree from './components/ProjectTree.jsx';
 import EditorToolbar from './components/EditorToolbar.jsx';
 import OutputPanel from './components/OutputPanel.jsx';
 import { backendHttpUrl, backendWebSocketUrl } from './backendConfig.js';
 import { createCollaborationSession, getRoomUiState } from './collaborationLifecycle.js';
+import { getPresenceParticipants, getVisiblePresenceParticipants } from './collaboratorPresence.js';
+import { buildProjectTree, filterProjectTree } from './projectTree.js';
+import { registerCodeSnippetProviders } from './codeSnippets.js';
+import { getSelectedFileLanguage, resolveFileLanguage } from './fileLanguage.js';
 import { handleWorkspaceShortcut } from './workspaceInteractions.js';
 import { hashEditorText, isConfirmedPersistedRevision } from './durableRevision.js';
 import {
@@ -47,59 +53,6 @@ const apiErrorMessage = async (response, fallback) => {
   }
 };
 
-const languageAliases = {
-  js: 'javascript',
-  jsx: 'javascript',
-  mjs: 'javascript',
-  cjs: 'javascript',
-  ts: 'typescript',
-  tsx: 'typescript',
-  py: 'python',
-  sh: 'shell',
-  yml: 'yaml',
-  md: 'markdown',
-};
-
-const languageLabels = {
-  javascript: 'JavaScript',
-  typescript: 'TypeScript',
-  css: 'CSS',
-  scss: 'SCSS',
-  less: 'Less',
-  html: 'HTML',
-  json: 'JSON',
-  markdown: 'Markdown',
-  python: 'Python',
-  java: 'Java',
-  c: 'C',
-  cpp: 'C++',
-  csharp: 'C#',
-  go: 'Go',
-  rust: 'Rust',
-  yaml: 'YAML',
-  xml: 'XML',
-  sql: 'SQL',
-  shell: 'Shell',
-  plaintext: 'Plain text',
-};
-
-const extensionLanguage = {
-  js: 'javascript', jsx: 'javascript', mjs: 'javascript', cjs: 'javascript',
-  ts: 'typescript', tsx: 'typescript', css: 'css', scss: 'scss', less: 'less',
-  html: 'html', htm: 'html', json: 'json', md: 'markdown', markdown: 'markdown',
-  py: 'python', java: 'java', c: 'c', h: 'cpp', cc: 'cpp', cpp: 'cpp',
-  cs: 'csharp', go: 'go', rs: 'rust', yml: 'yaml', yaml: 'yaml',
-  xml: 'xml', sql: 'sql', sh: 'shell', bash: 'shell', txt: 'plaintext',
-};
-
-const getLanguage = (fileName, storedLanguage) => {
-  const stored = typeof storedLanguage === 'string' ? storedLanguage.trim().toLowerCase() : '';
-  const extension = fileName?.split('.').pop()?.toLowerCase() || '';
-  const candidate = stored ? (languageAliases[stored] || stored) : (extensionLanguage[extension] || 'plaintext');
-  const id = languageLabels[candidate] ? candidate : (extensionLanguage[extension] || 'plaintext');
-  return { id, label: languageLabels[id] || languageLabels.plaintext };
-};
-
 const FileTypeIcon = ({ name, size = 16 }) => {
   const extension = name.split('.').pop()?.toLowerCase();
   if (extension === 'json') return <FileJson2 size={size} aria-hidden="true" />;
@@ -116,11 +69,15 @@ function App() {
   const [activeTab, setActiveTab] = useState('files');
   
   const [fileList, setFileList] = useState([]);
+  const [folderList, setFolderList] = useState([]);
   const [activeFile, setActiveFile] = useState('');
   const [isEditorReady, setIsEditorReady] = useState(false);
   const [fileSearch, setFileSearch] = useState('');
+  const [newFolderName, setNewFolderName] = useState('');
+  const [selectedFolder, setSelectedFolder] = useState('');
+  const [expandedFolders, setExpandedFolders] = useState(() => new Set());
   const [mobileExplorerOpen, setMobileExplorerOpen] = useState(false);
-  const [fileLanguage, setFileLanguage] = useState({ file: '', ...getLanguage('') });
+  const [fileLanguage, setFileLanguage] = useState({ file: '', ...resolveFileLanguage('') });
   const [paletteMode, setPaletteMode] = useState(null);
   const [outputEntries, setOutputEntries] = useState([]);
   const [outputOpen, setOutputOpen] = useState(false);
@@ -181,13 +138,18 @@ function App() {
   const fetchFiles = useCallback(async () => {
     try {
       setFileLoadState('loading');
-      const res = await fetch(`${backendHttpUrl}/api/files`);
-      if (!res.ok) throw new Error('File list request failed');
-      const files = await res.json();
-      if (!Array.isArray(files)) throw new Error('Invalid file list response');
+      const [res, foldersRes] = await Promise.all([
+        fetch(`${backendHttpUrl}/api/files`),
+        fetch(`${backendHttpUrl}/api/folders`),
+      ]);
+      if (!res.ok || !foldersRes.ok) throw new Error('Project list request failed');
+      const [files, folders] = await Promise.all([res.json(), foldersRes.json()]);
+      if (!Array.isArray(files) || !Array.isArray(folders)) throw new Error('Invalid project list response');
       setFileList(files);
+      setFolderList(folders);
+      setSelectedFolder(current => current && folders.includes(current) ? current : '');
       if (files.length > 0) setActiveFile(current => current || files[0]);
-      setFileLoadState(files.length === 0 ? 'empty' : 'populated');
+      setFileLoadState(files.length === 0 && folders.length === 0 ? 'empty' : 'populated');
     } catch (err) {
       console.error(err);
       setFileLoadState('error');
@@ -218,7 +180,7 @@ function App() {
 
   useEffect(() => {
     if (!activeFile) {
-      setFileLanguage({ file: '', ...getLanguage('') });
+      setFileLanguage({ file: '', ...resolveFileLanguage('') });
       setActiveUsers([]);
       setRoomState({ file: '', connection: 'disconnected', synced: false, initialSyncComplete: false, unavailable: false });
       setIsEditorReady(false);
@@ -227,7 +189,7 @@ function App() {
     }
 
     let cancelled = false;
-    const fallback = getLanguage(activeFile);
+    const fallback = resolveFileLanguage(activeFile);
     setFileLanguage({ file: activeFile, ...fallback });
 
     const loadLanguage = async () => {
@@ -236,7 +198,7 @@ function App() {
         if (!response.ok) return;
         const metadata = await response.json();
         if (!cancelled) {
-          setFileLanguage({ file: activeFile, ...getLanguage(activeFile, metadata?.language) });
+          setFileLanguage({ file: activeFile, ...resolveFileLanguage(activeFile, metadata?.language) });
         }
       } catch {
         // The extension mapping keeps editor language useful when metadata is unavailable.
@@ -284,16 +246,17 @@ function App() {
   const handleCreateFile = async (e) => {
     e.preventDefault();
     if (!newFileName.trim()) return;
+    const name = [selectedFolder, newFileName.trim()].filter(Boolean).join('/');
     try {
       const res = await fetch(`${backendHttpUrl}/api/files`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: newFileName.trim() }),
+        body: JSON.stringify({ name }),
       });
       if (res.ok) {
-        const name = newFileName.trim();
         setNewFileName('');
         await fetchFiles();
+        if (selectedFolder) setExpandedFolders(current => new Set([...current, selectedFolder]));
         setPendingProjectNavigation(null);
         setActiveFile(name);
         setOperationNotice({ type: 'success', message: `Created ${name}.` });
@@ -309,6 +272,46 @@ function App() {
       addOutput('Could not reach the backend to create the file.', 'error', 'Files');
     }
   };
+
+  const handleCreateFolder = async (e) => {
+    e.preventDefault();
+    if (!newFolderName.trim()) return;
+    const folderPath = [selectedFolder, newFolderName.trim()].filter(Boolean).join('/');
+    try {
+      const response = await fetch(`${backendHttpUrl}/api/folders`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: folderPath }),
+      });
+      if (!response.ok) {
+        const message = await apiErrorMessage(response, 'Could not create the folder.');
+        setOperationNotice({ type: 'error', message });
+        addOutput(message, 'error', 'Folders');
+        return;
+      }
+
+      setNewFolderName('');
+      await fetchFiles();
+      setSelectedFolder(folderPath);
+      setExpandedFolders(current => new Set([...current, selectedFolder, folderPath]));
+      setOperationNotice({ type: 'success', message: `Created folder ${folderPath}.` });
+      addOutput(`Created folder ${folderPath}.`, 'success', 'Folders');
+    } catch (error) {
+      console.error(error);
+      setOperationNotice({ type: 'error', message: 'Could not reach the backend to create the folder.' });
+      addOutput('Could not reach the backend to create the folder.', 'error', 'Folders');
+    }
+  };
+
+  const handleSelectFolder = useCallback(folderPath => {
+    setSelectedFolder(folderPath);
+    setExpandedFolders(current => {
+      const next = new Set(current);
+      if (next.has(folderPath)) next.delete(folderPath);
+      else next.add(folderPath);
+      return next;
+    });
+  }, []);
 
   const handleDeleteFile = async (e, fileName) => {
     e.stopPropagation();
@@ -411,9 +414,7 @@ function App() {
       const safeColor = color => /^#[\da-f]{6}$/i.test(color || '') ? color : '#8aa4c7';
       const onAwarenessChange = () => {
         const states = provider.awareness.getStates();
-        const users = Array.from(states, ([clientId, state]) => (
-          state.user ? { ...state.user, clientId, isCurrentSession: clientId === provider.awareness.clientID } : null
-        )).filter(Boolean).sort((a, b) => a.clientId - b.clientId);
+        const users = getPresenceParticipants(states, provider.awareness.clientID);
         setActiveUsers(users);
         cursorStyle.textContent = users
           .filter(user => !user.isCurrentSession && Number.isSafeInteger(user.clientId))
@@ -453,6 +454,7 @@ function App() {
           hasConnected = true;
           setRoomState(current => ({ ...current, file: activeFile, connection: 'connected', synced: false }));
         } else if (status === 'connecting' || status === 'disconnected') {
+          setActiveUsers([]);
           if (status === 'disconnected' && hasConnected && !connectionInterrupted) {
             connectionInterrupted = true;
             addOutput('Collaboration connection interrupted; reconnecting automatically.', 'warning', 'Collaboration');
@@ -467,6 +469,7 @@ function App() {
       };
       const onSync = isSynced => {
         if (isSynced) {
+          onAwarenessChange();
           addOutput(hasSynced
             ? 'Yjs document resynchronized with the collaboration session.'
             : 'Yjs document synchronized; durable revision confirmation is checked separately.', 'success', 'Collaboration');
@@ -475,6 +478,7 @@ function App() {
           hasConnected = true;
           setRoomState(current => ({ ...current, file: activeFile, connection: 'connected', synced: true, initialSyncComplete: true }));
         } else {
+          setActiveUsers([]);
           setRoomState(current => ({
             ...current,
             file: activeFile,
@@ -663,8 +667,8 @@ function App() {
     );
   }
 
-  const visibleFiles = fileList.filter(fileName => fileName.toLowerCase().includes(fileSearch.trim().toLowerCase()));
-  const selectedLanguage = fileLanguage.file === activeFile ? fileLanguage : getLanguage(activeFile);
+  const projectTree = filterProjectTree(buildProjectTree(fileList, folderList), fileSearch);
+  const selectedLanguage = getSelectedFileLanguage(activeFile, fileLanguage);
   const currentRoomState = activeFile && roomState.file === activeFile
     ? roomState
     : { file: activeFile, connection: activeFile ? 'connecting' : 'disconnected', synced: false, initialSyncComplete: false, unavailable: false };
@@ -694,12 +698,9 @@ function App() {
           : !hasConfirmedEditorRevision
             ? 'Waiting for the backend to confirm this exact editor text is durably persisted.'
             : executionUnavailableReason;
-  const visibleUsers = roomUiState.showCollaborators ? activeUsers : [];
-  const duplicateNames = visibleUsers.reduce((counts, user) => {
-    counts.set(user.name, (counts.get(user.name) || 0) + 1);
-    return counts;
-  }, new Map());
-  const seenNames = new Map();
+  const visibleUsers = roomUiState.showCollaborators
+    ? getVisiblePresenceParticipants(activeUsers, currentRoomStatus)
+    : [];
 
   return (
     <div className="App-container">
@@ -724,23 +725,7 @@ function App() {
           <span className="connection-dot" aria-hidden="true" />
           <span className="connection-label">{statusLabel}</span>
         </div>
-        <div className="header-presence" role="group" aria-label="Connected collaborators">
-          {visibleUsers.length > 0 ? visibleUsers.map(user => {
-            const seen = (seenNames.get(user.name) || 0) + 1;
-            seenNames.set(user.name, seen);
-            const duplicateSuffix = duplicateNames.get(user.name) > 1 ? ` · ${seen}` : '';
-            const userLabel = `${user.name}${duplicateSuffix}${user.isCurrentSession ? ' (you)' : ''}`;
-            return (
-              <div className="presence-person" key={user.clientId} title={userLabel}>
-                <span className="presence-avatar" style={{ backgroundColor: user.color || '#64748b' }} aria-hidden="true">
-                  {user.name?.trim()?.charAt(0)?.toUpperCase() || <User size={13} />}
-                  {duplicateSuffix && <span className="presence-index">{seen}</span>}
-                </span>
-                <span className="presence-name">{userLabel}</span>
-              </div>
-            );
-          }) : <span className="presence-empty"><Users size={15} aria-hidden="true" /> No collaborators yet</span>}
-        </div>
+        {roomUiState.showCollaborators && <CollaboratorPresence participants={visibleUsers} connectionStatus={currentRoomStatus} />}
         <div className="profile-chip" title="Selected collaboration profile">
           <span className="profile-color-dot" style={{ backgroundColor: currentUser.color }} aria-hidden="true" />
           <span>{currentUser.name}</span>
@@ -777,25 +762,36 @@ function App() {
         {activeTab === 'files' ? (
           <>
             <label className="search-box" htmlFor="file-search"><Search size={15} aria-hidden="true" /><input id="file-search" type="search" placeholder="Find a file" value={fileSearch} onChange={e => setFileSearch(e.target.value)} /></label>
+            <button type="button" className="project-root-target" aria-pressed={!selectedFolder}
+              onClick={() => setSelectedFolder('')}>
+              <FolderCode size={14} aria-hidden="true" /> Project root
+            </button>
+            <div className="project-create-target">Creating in <strong>{selectedFolder || 'Project root'}</strong></div>
             <form className="input-group create-file-form" onSubmit={handleCreateFile}>
               <label className="visually-hidden" htmlFor="new-file-name">New file name</label>
               <input id="new-file-name" type="text" className="text-input" placeholder="e.g. main.js" value={newFileName} onChange={(e) => setNewFileName(e.target.value)} />
               <button type="submit" className="action-btn" aria-label="Create file"><Plus size={18} /><span>New file</span></button>
             </form>
-            <ul className="item-list" aria-label="Project files">
-              {fileLoadState === 'loading' && <li className="list-message" role="status">Loading files…</li>}
-              {fileLoadState === 'error' && <li className="list-message error" role="alert">Could not load files. Check that the backend is running, then retry.</li>}
-              {fileLoadState === 'empty' && <li className="list-message">No files yet. Create one to get started.</li>}
-              {fileLoadState === 'populated' && visibleFiles.length === 0 && <li className="list-message">No files match “{fileSearch}”.</li>}
-              {visibleFiles.map(fileName => (
-                  <li key={fileName} className={`list-item ${fileName === activeFile ? 'active' : ''}`}>
-                  <button className="file-select-btn" aria-current={fileName === activeFile ? 'page' : undefined} onClick={() => { setPendingProjectNavigation(null); setActiveFile(fileName); setMobileExplorerOpen(false); }}>
-                    <FileTypeIcon name={fileName} /><span>{fileName}</span>
-                  </button>
-                  <button className="delete-btn" onClick={(e) => handleDeleteFile(e, fileName)} aria-label={`Delete ${fileName}`} title="Delete file"><Trash2 size={14} /></button>
-                </li>
-              ))}
-            </ul>
+            <form className="input-group create-folder-form" onSubmit={handleCreateFolder}>
+              <label className="visually-hidden" htmlFor="new-folder-name">New folder name</label>
+              <input id="new-folder-name" type="text" className="text-input" placeholder="New folder" value={newFolderName} onChange={event => setNewFolderName(event.target.value)} />
+              <button type="submit" className="action-btn" aria-label="Create folder"><FolderPlus size={17} /><span>Folder</span></button>
+            </form>
+            {fileLoadState === 'loading' && fileList.length === 0 && folderList.length === 0 && <p className="list-message" role="status">Loading project…</p>}
+            {fileLoadState === 'error' && <p className="list-message error" role="alert">Could not load project files and folders. Check that the backend is running, then retry.</p>}
+            {fileLoadState === 'empty' && <p className="list-message">No files or folders yet. Create one to get started.</p>}
+            {fileLoadState === 'populated' && fileSearch.trim() && projectTree.files.length === 0 && projectTree.folders.length === 0
+              && <p className="list-message">No files or folders match “{fileSearch}”.</p>}
+            <ProjectTree
+              tree={projectTree}
+              activeFile={activeFile}
+              selectedFolder={selectedFolder}
+              expandedFolders={expandedFolders}
+              FileIcon={FileTypeIcon}
+              onSelectFolder={handleSelectFolder}
+              onOpenFile={fileName => { setPendingProjectNavigation(null); setActiveFile(fileName); setMobileExplorerOpen(false); }}
+              onDeleteFile={handleDeleteFile}
+            />
           </>
         ) : (
           <>
@@ -844,6 +840,7 @@ function App() {
           openPalette={openPalette}
           outputOpen={outputOpen}
           setOutputOpen={setOutputOpen}
+          roomStatus={currentRoomStatus}
           persistedRevision={hasConfirmedEditorRevision ? persistedRevision : null}
           executionUnavailableReason={runDisabledReason}
         />
@@ -864,7 +861,8 @@ function App() {
                 fontFamily: "'DM Mono', 'Consolas', monospace",
                 padding: { top: 16 }
               }}
-              onMount={(editor) => {
+              onMount={(editor, monaco) => {
+                registerCodeSnippetProviders(monaco);
                 editorRef.current = editor;
                 setEditorText(editor.getValue());
                 setIsEditorReady(true);
