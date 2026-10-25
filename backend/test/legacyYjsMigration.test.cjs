@@ -78,6 +78,7 @@ function makeManifest(dataDir, overrides = {}) {
 
 function assertRoomRejected(dataDir, room, expectedCode) {
   const persistence = createYjsPersistence({ Y, dataDir });
+  persistence.registerRoom(room, room);
   const doc = new Y.Doc();
   assert.throws(() => persistence.persistence.bindState(room, doc), error => {
     assert.equal(error.code, expectedCode);
@@ -126,12 +127,15 @@ test('preparation verifies backups and staged Yjs state, then explicit activatio
 
     for (const room of MIGRATABLE_LEGACY_ROOMS) {
       const persistence = createYjsPersistence({ Y, dataDir });
+      persistence.registerRoom(room, room);
       const recovered = new Y.Doc();
       persistence.persistence.bindState(room, recovered);
       assert.equal(recovered.getText('monaco').toString(), expected[room]);
       recovered.getText('monaco').insert(recovered.getText('monaco').length, '!');
       const reloaded = new Y.Doc();
-      createYjsPersistence({ Y, dataDir }).persistence.bindState(room, reloaded);
+      const reloadedPersistence = createYjsPersistence({ Y, dataDir });
+      reloadedPersistence.registerRoom(room, room);
+      reloadedPersistence.persistence.bindState(room, reloaded);
       assert.equal(reloaded.getText('monaco').toString(), `${expected[room]}!`);
       recovered.destroy();
       reloaded.destroy();

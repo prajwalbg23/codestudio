@@ -4,12 +4,13 @@ import { EventEmitter } from 'node:events';
 import {
   createCollaborationSession,
   getRoomUiState,
+  isDeletedRoomClose,
   isUnavailableRoomClose,
 } from '../src/collaborationLifecycle.js';
 import { getPresenceParticipants } from '../src/collaboratorPresence.js';
 
-function makeSession({ isCurrent = () => true, onUnavailable = () => {}, onStatus = () => {}, onAwarenessChange = () => {} } = {}) {
-  const calls = { binding: 0, provider: 0, doc: 0, style: 0, awarenessNull: 0, unavailable: 0, status: [] };
+function makeSession({ isCurrent = () => true, onUnavailable = () => {}, onDeleted = () => {}, onStatus = () => {}, onAwarenessChange = () => {} } = {}) {
+  const calls = { binding: 0, provider: 0, doc: 0, style: 0, awarenessNull: 0, unavailable: 0, deleted: 0, status: [] };
   const provider = new EventEmitter();
   provider.awareness = new EventEmitter();
   provider.awareness.clientID = 1;
@@ -28,6 +29,7 @@ function makeSession({ isCurrent = () => true, onUnavailable = () => {}, onStatu
     isCurrent,
     onAwarenessChange,
     onUnavailable: () => { calls.unavailable += 1; onUnavailable(); },
+    onDeleted: () => { calls.deleted += 1; onDeleted(); },
     onStatus: status => { calls.status.push(status); onStatus(status); },
   });
   return { calls, provider, session };
@@ -66,7 +68,7 @@ test('explicit unavailable-room rejection immediately disposes every session res
   assert.equal(session.disposed, true);
   assert.deepEqual(calls, {
     binding: 1, provider: 1, doc: 1, style: 1, awarenessNull: 1,
-    unavailable: 1, status: [],
+    unavailable: 1, deleted: 0, status: [],
   });
   assert.equal(provider.listenerCount('status'), 0);
   assert.equal(provider.listenerCount('sync'), 0);
@@ -82,7 +84,7 @@ test('the same teardown path releases the prior session on file switch and unmou
     assert.equal(session.disposed, true, lifecycleEnd);
     assert.deepEqual(calls, {
       binding: 1, provider: 1, doc: 1, style: 1, awarenessNull: 1,
-      unavailable: 0, status: [],
+      unavailable: 0, deleted: 0, status: [],
     }, lifecycleEnd);
   }
 });
@@ -136,4 +138,20 @@ test('generic WebSocket disconnection is not classified as unavailable history',
   assert.equal(calls.unavailable, 0);
   assert.deepEqual(calls.status, [{ status: 'disconnected' }]);
   session.dispose();
+});
+
+test('explicit file-deleted room rejection tears down the active collaboration session', () => {
+  let deleted = 0;
+  const { calls, provider, session } = makeSession({ onDeleted: () => { deleted += 1; } });
+  const event = { code: 1008, reason: 'File deleted' };
+  assert.equal(isDeletedRoomClose(event), true);
+  provider.emit('connection-close', event);
+
+  assert.equal(deleted, 1);
+  assert.equal(session.disposed, true);
+  assert.equal(calls.binding, 1);
+  assert.equal(calls.provider, 1);
+  assert.equal(calls.doc, 1);
+  assert.equal(calls.awarenessNull, 1);
+  assert.equal(provider.listenerCount('connection-close'), 0);
 });

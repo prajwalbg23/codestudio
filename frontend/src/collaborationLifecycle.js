@@ -1,9 +1,15 @@
 export const UNAVAILABLE_ROOM_CLOSE_CODE = 1011;
 export const UNAVAILABLE_ROOM_CLOSE_REASON = 'Document history unavailable';
+export const DELETED_ROOM_CLOSE_CODE = 1008;
+export const DELETED_ROOM_CLOSE_REASON = 'File deleted';
 
 export function isUnavailableRoomClose(event) {
   return event?.code === UNAVAILABLE_ROOM_CLOSE_CODE
     && event.reason === UNAVAILABLE_ROOM_CLOSE_REASON;
+}
+
+export function isDeletedRoomClose(event) {
+  return event?.code === DELETED_ROOM_CLOSE_CODE && event.reason === DELETED_ROOM_CLOSE_REASON;
 }
 
 export function getRoomUiState(roomState, editorReady) {
@@ -34,6 +40,7 @@ export function createCollaborationSession({
   onSync,
   onConnectionError,
   onUnavailable,
+  onDeleted,
   onDisposed,
 }) {
   let disposed = false;
@@ -46,9 +53,12 @@ export function createCollaborationSession({
   const syncChange = guard(onSync);
   const connectionError = guard(onConnectionError);
   const connectionClose = event => {
-    if (disposed || !isCurrent() || !isUnavailableRoomClose(event)) return;
+    if (disposed || !isCurrent()) return;
+    const deleted = isDeletedRoomClose(event);
+    if (!deleted && !isUnavailableRoomClose(event)) return;
     try {
-      onUnavailable?.();
+      if (deleted) onDeleted?.();
+      else onUnavailable?.();
     } finally {
       dispose();
     }

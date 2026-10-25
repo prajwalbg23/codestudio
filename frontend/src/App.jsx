@@ -28,6 +28,8 @@ import EditorToolbar from './components/EditorToolbar.jsx';
 import OutputPanel from './components/OutputPanel.jsx';
 import { backendHttpUrl, backendWebSocketUrl } from './backendConfig.js';
 import { createCollaborationSession, getRoomUiState } from './collaborationLifecycle.js';
+import { getFileDeletionTransition, requestFileDeletion } from './fileDeletion.js';
+import { buildRenamePath, getDocumentRename, getFolderDeletionTransition, remapExpandedFolders, remapProjectPath, requestProjectRename } from './projectRename.js';
 import { getPresenceParticipants, getVisiblePresenceParticipants } from './collaboratorPresence.js';
 import { buildProjectTree, filterProjectTree } from './projectTree.js';
 import { registerCodeSnippetProviders } from './codeSnippets.js';
@@ -76,8 +78,11 @@ function App() {
   const [newFolderName, setNewFolderName] = useState('');
   const [selectedFolder, setSelectedFolder] = useState('');
   const [expandedFolders, setExpandedFolders] = useState(() => new Set());
+  const [renameTarget, setRenameTarget] = useState(null);
+  const [renameValue, setRenameValue] = useState('');
+  const [renamePending, setRenamePending] = useState(false);
   const [mobileExplorerOpen, setMobileExplorerOpen] = useState(false);
-  const [fileLanguage, setFileLanguage] = useState({ file: '', ...resolveFileLanguage('') });
+  const [fileLanguage, setFileLanguage] = useState({ file: '', documentId: '', ...resolveFileLanguage('') });
   const [paletteMode, setPaletteMode] = useState(null);
   const [outputEntries, setOutputEntries] = useState([]);
   const [outputOpen, setOutputOpen] = useState(false);
@@ -102,7 +107,18 @@ function App() {
   const providerRef = useRef(null);
   const bindingRef = useRef(null);
   const collaborationSessionRef = useRef(null);
+  const roomClientIdRef = useRef(null);
+  const handledDeletionPathsRef = useRef(new Set());
   const outputSequenceRef = useRef(0);
+  const activeFileRef = useRef(activeFile);
+  const fileLanguageRef = useRef(fileLanguage);
+  const applyProjectRenameRef = useRef(null);
+  const selectedFolderRef = useRef(selectedFolder);
+  const expandedFoldersRef = useRef(expandedFolders);
+  activeFileRef.current = activeFile;
+  fileLanguageRef.current = fileLanguage;
+  selectedFolderRef.current = selectedFolder;
+  expandedFoldersRef.current = expandedFolders;
 
   const addOutput = useCallback((message, level = 'info', source = 'CodeStudio') => {
     const timestamp = Date.now();
@@ -147,7 +163,16 @@ function App() {
       if (!Array.isArray(files) || !Array.isArray(folders)) throw new Error('Invalid project list response');
       setFileList(files);
       setFolderList(folders);
-      setSelectedFolder(current => current && folders.includes(current) ? current : '');
+      setSelectedFolder(current => {
+        const next = current && folders.includes(current) ? current : '';
+        selectedFolderRef.current = next;
+        return next;
+      });
+      setExpandedFolders(current => {
+        const next = new Set([...current].filter(folderPath => folders.includes(folderPath)));
+        expandedFoldersRef.current = next;
+        return next;
+      });
       if (files.length > 0) setActiveFile(current => current || files[0]);
       setFileLoadState(files.length === 0 && folders.length === 0 ? 'empty' : 'populated');
     } catch (err) {
@@ -178,9 +203,114 @@ function App() {
     fetchMembers();
   }, [fetchFiles, fetchMembers]);
 
+  const applyProjectRename = useCallback(event => {
+    if (!event || event.type !== 'rename') return;
+    const fileMappings = Array.isArray(event.files) ? event.files : [];
+    const folderMappings = Array.isArray(event.folders) ? event.folders : [];
+    const mappings = [...fileMappings, ...folderMappings];
+    if (mappings.length === 0) return;
+
+    const currentLanguage = fileLanguageRef.current;
+    const documentRename = getDocumentRename(event, currentLanguage.documentId);
+    const currentPath = activeFileRef.current;
+    const nextActivePath = documentRename?.newPath || remapProjectPath(currentPath, mappings);
+    const nextSelectedFolder = remapProjectPath(selectedFolderRef.current, folderMappings);
+    const nextExpandedFolders = remapExpandedFolders(expandedFoldersRef.current, folderMappings);
+    selectedFolderRef.current = nextSelectedFolder;
+    expandedFoldersRef.current = nextExpandedFolders;
+    setSelectedFolder(nextSelectedFolder);
+    setExpandedFolders(nextExpandedFolders);
+    setPendingProjectNavigation(current => current
+      ? { ...current, fileName: remapProjectPath(current.fileName, mappings) }
+      : current);
+
+    if (documentRename && currentPath && nextActivePath !== currentPath) {
+      const nextLanguage = {
+        ...resolveFileLanguage(nextActivePath, documentRename.language || currentLanguage.language),
+        file: nextActivePath,
+        documentId: documentRename.documentId,
+      };
+      activeFileRef.current = nextActivePath;
+      fileLanguageRef.current = nextLanguage;
+      if (roomClientIdRef.current?.documentId === documentRename.documentId) {
+        roomClientIdRef.current.file = nextActivePath;
+      }
+      setActiveFile(nextActivePath);
+      setFileLanguage(current => current.documentId === documentRename.documentId
+        ? nextLanguage
+        : current);
+      setRoomState(current => current.file === documentRename.oldPath
+        ? { ...current, file: nextActivePath }
+        : current);
+      setPersistedRevision(current => current?.documentId === documentRename.documentId
+        ? { ...current, fileName: nextActivePath }
+        : current);
+    }
+    void fetchFiles();
+  }, [fetchFiles]);
+  applyProjectRenameRef.current = applyProjectRename;
+
+  const applyProjectEvent = useCallback(event => {
+    if (event?.type === 'rename') {
+      applyProjectRename(event);
+      return;
+    }
+    const transition = getFolderDeletionTransition(event, {
+      selectedFolder: selectedFolderRef.current,
+      expandedFolders: expandedFoldersRef.current,
+    });
+    if (!transition) return;
+    setFolderList(current => current.filter(path => path !== transition.folderPath));
+    selectedFolderRef.current = transition.selectedFolder;
+    expandedFoldersRef.current = transition.expandedFolders;
+    setSelectedFolder(transition.selectedFolder);
+    setExpandedFolders(transition.expandedFolders);
+    void fetchFiles();
+  }, [applyProjectRename, fetchFiles]);
+
+  const refreshDocumentPath = useCallback(async documentId => {
+    if (!documentId) return;
+    try {
+      const response = await fetch(`${backendHttpUrl}/api/documents/${encodeURIComponent(documentId)}`);
+      if (!response.ok) return;
+      const document = await response.json();
+      const current = fileLanguageRef.current;
+      if (current.documentId !== documentId || typeof document.name !== 'string'
+        || document.name === activeFileRef.current) return;
+      applyProjectRenameRef.current?.({
+        type: 'rename',
+        files: [{ documentId, oldPath: activeFileRef.current, newPath: document.name }],
+        folders: [],
+      });
+    } catch {
+      // The active document identity remains valid; a later SSE reconnect can retry path resolution.
+    }
+  }, []);
+
+  useEffect(() => {
+    if (typeof EventSource === 'undefined') return undefined;
+    const events = new EventSource(`${backendHttpUrl}/api/project-events`);
+    const onProjectChange = event => {
+      try {
+        applyProjectEvent(JSON.parse(event.data));
+      } catch {
+        // Ignore malformed event payloads and keep the existing project state.
+      }
+    };
+    events.addEventListener('project-change', onProjectChange);
+    events.onopen = () => {
+      void fetchFiles();
+      void refreshDocumentPath(fileLanguageRef.current.documentId);
+    };
+    return () => {
+      events.removeEventListener('project-change', onProjectChange);
+      events.close();
+    };
+  }, [applyProjectEvent, fetchFiles, refreshDocumentPath]);
+
   useEffect(() => {
     if (!activeFile) {
-      setFileLanguage({ file: '', ...resolveFileLanguage('') });
+      setFileLanguage({ file: '', documentId: '', ...resolveFileLanguage('') });
       setActiveUsers([]);
       setRoomState({ file: '', connection: 'disconnected', synced: false, initialSyncComplete: false, unavailable: false });
       setIsEditorReady(false);
@@ -189,8 +319,10 @@ function App() {
     }
 
     let cancelled = false;
+    const knownLanguage = fileLanguageRef.current;
+    if (knownLanguage.file === activeFile && knownLanguage.documentId) return undefined;
     const fallback = resolveFileLanguage(activeFile);
-    setFileLanguage({ file: activeFile, ...fallback });
+    setFileLanguage({ file: activeFile, documentId: '', ...fallback });
 
     const loadLanguage = async () => {
       try {
@@ -198,7 +330,11 @@ function App() {
         if (!response.ok) return;
         const metadata = await response.json();
         if (!cancelled) {
-          setFileLanguage({ file: activeFile, ...resolveFileLanguage(activeFile, metadata?.language) });
+          setFileLanguage({
+            file: activeFile,
+            documentId: typeof metadata?.documentId === 'string' ? metadata.documentId : '',
+            ...resolveFileLanguage(activeFile, metadata?.language),
+          });
         }
       } catch {
         // The extension mapping keeps editor language useful when metadata is unavailable.
@@ -211,7 +347,8 @@ function App() {
 
   useEffect(() => {
     setPersistedRevision(null);
-    if (!activeFile || roomState.file !== activeFile || !roomState.synced
+    const documentId = fileLanguage.documentId;
+    if (!activeFile || !documentId || roomState.file !== activeFile || !roomState.synced
       || roomState.unavailable || roomState.connection !== 'connected' || !isEditorReady) {
       return undefined;
     }
@@ -220,7 +357,7 @@ function App() {
     const fileName = activeFile;
     const refreshPersistedRevision = async () => {
       try {
-        const response = await fetch(`${backendHttpUrl}/api/files/${encodeURIComponent(fileName)}/revisions/latest`);
+        const response = await fetch(`${backendHttpUrl}/api/documents/${encodeURIComponent(documentId)}/revisions/latest`);
         if (!response.ok) return;
         const revision = await response.json();
         const currentModel = editorRef.current?.getModel();
@@ -228,7 +365,7 @@ function App() {
         const currentHash = typeof currentText === 'string' ? await hashEditorText(currentText) : null;
         if (!cancelled && currentModel && currentModel.getValue() === currentText
           && currentHash === revision.sourceHash) {
-          setPersistedRevision({ fileName, ...revision });
+          setPersistedRevision({ fileName, documentId, ...revision });
         }
       } catch {
         // A failed confirmation leaves Run disabled; the next poll can retry.
@@ -241,7 +378,7 @@ function App() {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [activeFile, roomState.file, roomState.connection, roomState.synced, roomState.unavailable, isEditorReady]);
+  }, [activeFile, fileLanguage.documentId, roomState.file, roomState.connection, roomState.synced, roomState.unavailable, isEditorReady]);
 
   const handleCreateFile = async (e) => {
     e.preventDefault();
@@ -313,28 +450,114 @@ function App() {
     });
   }, []);
 
+  const applyDeletedFile = useCallback((fileName, message, result = { ok: true }) => {
+    if (handledDeletionPathsRef.current.has(fileName)) return;
+    handledDeletionPathsRef.current.add(fileName);
+    const transition = getFileDeletionTransition(result, activeFileRef.current, fileName);
+    if (transition.closeActiveSession) {
+      setPendingProjectNavigation(null);
+      setActiveFile(transition.activeFile);
+      setIsEditorReady(false);
+      editorRef.current = null;
+    }
+    setActiveUsers([]);
+    void fetchFiles();
+    setOperationNotice({ type: 'success', message });
+    addOutput(message, 'success', 'Files');
+  }, [fetchFiles, addOutput]);
+
   const handleDeleteFile = async (e, fileName) => {
     e.stopPropagation();
     if (!confirm(`Delete ${fileName}?`)) return;
+    const roomClientId = roomClientIdRef.current?.file === fileName
+      ? roomClientIdRef.current.clientId : null;
+    const result = await requestFileDeletion({
+      backendHttpUrl,
+      fileName,
+      clientId: roomClientId,
+    });
+    if (result.ok) {
+      applyDeletedFile(fileName, `Deleted ${fileName}.`, result);
+    } else {
+      setOperationNotice({ type: 'error', message: result.message });
+      addOutput(result.message, 'error', 'Files');
+    }
+  };
+
+  const handleDeleteFolder = async (event, folderPath) => {
+    event.stopPropagation();
+    if (!confirm(`Delete empty folder ${folderPath}? Folders with live files or child folders cannot be deleted. Deleted-file history will be retained.`)) return;
     try {
-      const res = await fetch(`${backendHttpUrl}/api/files/${encodeURIComponent(fileName)}`, { method: 'DELETE' });
-      if (res.ok) {
-        if (activeFile === fileName) {
-          setPendingProjectNavigation(null);
-          setActiveFile('');
-        }
-        await fetchFiles();
-        setOperationNotice({ type: 'success', message: `Deleted ${fileName}.` });
-        addOutput(`Deleted ${fileName}.`, 'success', 'Files');
-      } else {
-        const message = await apiErrorMessage(res, 'Could not delete the file.');
+      const response = await fetch(`${backendHttpUrl}/api/folders/${encodeURIComponent(folderPath)}`, { method: 'DELETE' });
+      if (!response.ok) {
+        const message = await apiErrorMessage(response, 'Could not delete the folder.');
         setOperationNotice({ type: 'error', message });
-        addOutput(message, 'error', 'Files');
+        addOutput(message, 'error', 'Folders');
+        return;
       }
-    } catch (err) {
-      console.error(err);
-      setOperationNotice({ type: 'error', message: 'Could not reach the backend to delete the file.' });
-      addOutput('Could not reach the backend to delete the file.', 'error', 'Files');
+      const result = await response.json();
+      applyProjectEvent({ type: 'folder-deleted', folder: { path: result.folder.path } });
+      const message = `Deleted empty folder ${folderPath}. Deleted-file history was retained.`;
+      setOperationNotice({ type: 'success', message });
+      addOutput(message, 'success', 'Folders');
+    } catch {
+      const message = 'Could not reach the backend to delete the folder.';
+      setOperationNotice({ type: 'error', message });
+      addOutput(message, 'error', 'Folders');
+    }
+  };
+
+  const beginRename = (kind, oldPath) => {
+    const name = oldPath.slice(oldPath.lastIndexOf('/') + 1);
+    setRenameTarget({ kind, oldPath });
+    setRenameValue(name);
+    setOperationNotice(null);
+  };
+
+  const handleRenameSubmit = async event => {
+    event.preventDefault();
+    if (!renameTarget || renamePending) return;
+    let newPath;
+    try {
+      newPath = buildRenamePath(renameTarget.oldPath, renameValue, renameTarget.kind);
+    } catch (error) {
+      setOperationNotice({ type: 'error', message: error.message });
+      return;
+    }
+
+    setRenamePending(true);
+    const isFolder = renameTarget.kind === 'folder';
+    try {
+      const result = await requestProjectRename({
+        backendHttpUrl,
+        kind: renameTarget.kind,
+        oldPath: renameTarget.oldPath,
+        newPath,
+      });
+      const event = {
+        type: 'rename',
+        files: Array.isArray(result.renamedFiles) ? result.renamedFiles : [],
+        folders: Array.isArray(result.renamedFolders) ? result.renamedFolders : [],
+      };
+      if (!isFolder && result.file?.documentId) {
+        event.files = [{ documentId: result.file.documentId, oldPath: renameTarget.oldPath, newPath: result.file.name }];
+      } else if (isFolder && event.folders.length === 0) {
+        event.folders = [{ oldPath: renameTarget.oldPath, newPath: result.folder.path }];
+      }
+      applyProjectRename(event);
+      setRenameTarget(null);
+      setRenameValue('');
+      const label = `${isFolder ? 'Folder' : 'File'} renamed to ${newPath}.`;
+      setOperationNotice({ type: 'success', message: label });
+      addOutput(label, 'success', isFolder ? 'Folders' : 'Files');
+    } catch (error) {
+      const message = error.isServerResponse
+        ? error.message
+        : `Could not reach the backend to rename the ${renameTarget.kind}.`;
+      setOperationNotice({ type: 'error', message });
+      addOutput(message, 'error', isFolder ? 'Folders' : 'Files');
+    } finally {
+      setRenamePending(false);
     }
   };
 
@@ -386,12 +609,21 @@ function App() {
   };
 
   useEffect(() => {
-    if (activeFile && isEditorReady && currentUser) {
+    const currentFile = activeFileRef.current;
+    const currentLanguage = fileLanguageRef.current;
+    if (currentFile && (currentLanguage.file !== currentFile || !currentLanguage.documentId)) {
+      return undefined;
+    }
+    if (currentFile && isEditorReady && currentUser) {
+      const sessionFile = currentFile;
+      const documentId = fileLanguage.documentId;
       setActiveUsers([]);
-      setRoomState({ file: activeFile, connection: 'connecting', synced: false, initialSyncComplete: false, unavailable: false });
-      addOutput(`Opening collaboration session for ${activeFile}.`, 'info', 'Collaboration');
+      setRoomState({ file: sessionFile, documentId, connection: 'connecting', synced: false, initialSyncComplete: false, unavailable: false });
+      addOutput(`Opening collaboration session for ${sessionFile}.`, 'info', 'Collaboration');
       const ydoc = new Y.Doc();
-      const provider = new WebsocketProvider(backendWebSocketUrl, activeFile, ydoc);
+      const clientId = window.crypto.randomUUID();
+      roomClientIdRef.current = { file: sessionFile, documentId, clientId };
+      const provider = new WebsocketProvider(backendWebSocketUrl, documentId, ydoc, { params: { clientId } });
       const ytext = ydoc.getText('monaco');
       
       const binding = new MonacoBinding(
@@ -448,11 +680,12 @@ function App() {
       let remotePeers = new Map();
       const onStatus = ({ status }) => {
         if (status === 'connected') {
+          void refreshDocumentPath(documentId);
           if (hasConnected && connectionInterrupted) {
             addOutput('WebSocket reconnected; waiting for Yjs synchronization.', 'info', 'Collaboration');
           }
           hasConnected = true;
-          setRoomState(current => ({ ...current, file: activeFile, connection: 'connected', synced: false }));
+          setRoomState(current => ({ ...current, file: activeFileRef.current, documentId, connection: 'connected', synced: false }));
         } else if (status === 'connecting' || status === 'disconnected') {
           setActiveUsers([]);
           if (status === 'disconnected' && hasConnected && !connectionInterrupted) {
@@ -461,7 +694,8 @@ function App() {
           }
           setRoomState(current => ({
             ...current,
-            file: activeFile,
+            file: activeFileRef.current,
+            documentId,
             connection: hasConnected ? 'reconnecting' : status,
             synced: false,
           }));
@@ -476,12 +710,13 @@ function App() {
           hasSynced = true;
           connectionInterrupted = false;
           hasConnected = true;
-          setRoomState(current => ({ ...current, file: activeFile, connection: 'connected', synced: true, initialSyncComplete: true }));
+          setRoomState(current => ({ ...current, file: activeFileRef.current, documentId, connection: 'connected', synced: true, initialSyncComplete: true }));
         } else {
           setActiveUsers([]);
           setRoomState(current => ({
             ...current,
-            file: activeFile,
+            file: activeFileRef.current,
+            documentId,
             connection: hasConnected ? 'reconnecting' : 'connecting',
             synced: false,
           }));
@@ -504,15 +739,20 @@ function App() {
         onConnectionError,
         onUnavailable: () => {
           setActiveUsers([]);
-          setRoomState({ file: activeFile, connection: 'unavailable', synced: false, initialSyncComplete: false, unavailable: true });
+          setRoomState({ file: activeFileRef.current, documentId, connection: 'unavailable', synced: false, initialSyncComplete: false, unavailable: true });
           setIsEditorReady(false);
           editorRef.current = null;
           addOutput('The server marked this room history unavailable. Editing is blocked; disk persistence status is unknown.', 'error', 'Collaboration');
+        },
+        onDeleted: () => {
+          const currentPath = activeFileRef.current;
+          applyDeletedFile(currentPath, `${currentPath} was deleted and its history has been preserved.`);
         },
         onDisposed: () => {
           if (collaborationSessionRef.current === session) collaborationSessionRef.current = null;
           if (providerRef.current === provider) providerRef.current = null;
           if (bindingRef.current === binding) bindingRef.current = null;
+          if (roomClientIdRef.current?.clientId === clientId) roomClientIdRef.current = null;
         },
       });
       collaborationSessionRef.current = session;
@@ -524,7 +764,7 @@ function App() {
     }
 
     return undefined;
-  }, [activeFile, isEditorReady, currentUser, addOutput]);
+  }, [fileLanguage.documentId, isEditorReady, currentUser, addOutput, applyDeletedFile, refreshDocumentPath]);
 
   const readCurrentText = useCallback(() => editorRef.current?.getModel()?.getValue() || '', []);
   const searchProject = useCallback(async (searchOptions, signal) => {
@@ -791,6 +1031,9 @@ function App() {
               onSelectFolder={handleSelectFolder}
               onOpenFile={fileName => { setPendingProjectNavigation(null); setActiveFile(fileName); setMobileExplorerOpen(false); }}
               onDeleteFile={handleDeleteFile}
+              onRenameFile={fileName => beginRename('file', fileName)}
+              onRenameFolder={folderPath => beginRename('folder', folderPath)}
+              onDeleteFolder={handleDeleteFolder}
             />
           </>
         ) : (
@@ -852,7 +1095,7 @@ function App() {
             <Editor
               height="100%"
               theme="vs-dark"
-              path={activeFile}
+              path={fileLanguage.documentId || activeFile}
               language={selectedLanguage.id}
               options={{
                 readOnly: editorReadOnly,
@@ -886,6 +1129,22 @@ function App() {
         onToggleCollapse={() => setOutputCollapsed(value => !value)}
         onToggleExpand={() => setOutputExpanded(value => !value)}
       />}
+      {renameTarget && <div className="rename-backdrop" role="presentation" onMouseDown={event => {
+        if (event.target === event.currentTarget && !renamePending) setRenameTarget(null);
+      }}>
+        <form className="rename-dialog" role="dialog" aria-modal="true" aria-labelledby="rename-title" onSubmit={handleRenameSubmit}>
+          <h2 id="rename-title">Rename {renameTarget.kind}</h2>
+          <p>Choose a new name for <code>{renameTarget.oldPath}</code>. Its document identity and history will stay the same.</p>
+          {operationNotice?.type === 'error' && <p className="rename-error" role="alert">{operationNotice.message}</p>}
+          <label htmlFor="rename-project-path">New name</label>
+          <input id="rename-project-path" autoFocus value={renameValue} disabled={renamePending}
+            onChange={event => setRenameValue(event.target.value)} />
+          <div className="rename-dialog-actions">
+            <button type="button" className="toolbar-action" disabled={renamePending} onClick={() => setRenameTarget(null)}>Cancel</button>
+            <button type="submit" className="action-btn" disabled={renamePending}>{renamePending ? 'Renaming…' : 'Rename'}</button>
+          </div>
+        </form>
+      </div>}
       {paletteMode && <CommandPalette
         mode={paletteMode} files={fileList} activeFile={activeFile} onClose={closePalette}
         onOpenFile={handleOpenFile} readCurrentText={readCurrentText} onNavigate={navigateToMatch}

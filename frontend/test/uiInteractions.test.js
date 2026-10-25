@@ -10,6 +10,7 @@ import { handleWorkspaceShortcut } from '../src/workspaceInteractions.js';
 import { getRoomUiState } from '../src/collaborationLifecycle.js';
 import { getPresenceParticipants, getVisiblePresenceParticipants } from '../src/collaboratorPresence.js';
 import { buildProjectTree } from '../src/projectTree.js';
+import { getFileDeletionTransition, requestFileDeletion } from '../src/fileDeletion.js';
 
 const frontendRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const dom = new JSDOM('<!doctype html><html><body></body></html>', { url: 'http://localhost/' });
@@ -137,6 +138,33 @@ test('Escape closes the command palette first and closes the mobile explorer whe
   });
   assert.deepEqual(actions, ['palette', 'explorer']);
   assert.equal(explorerEvent.defaultPrevented, false);
+});
+
+test('project tree exposes accessible rename controls for files and folders', () => {
+  const renamed = [];
+  const deleted = [];
+  const mounted = mount(React.createElement(ProjectTree, {
+    tree: buildProjectTree(['src/main.js'], ['src']),
+    activeFile: 'src/main.js',
+    selectedFolder: 'src',
+    expandedFolders: new Set(['src']),
+    FileIcon: () => React.createElement('span', null, 'JS'),
+    onSelectFolder: () => {},
+    onOpenFile: () => {},
+    onDeleteFile: () => {},
+    onRenameFile: path => renamed.push(['file', path]),
+    onRenameFolder: path => renamed.push(['folder', path]),
+    onDeleteFolder: (_event, path) => deleted.push(path),
+  }));
+  try {
+    act(() => mounted.container.querySelector('[aria-label="Rename file src/main.js"]').click());
+    act(() => mounted.container.querySelector('[aria-label="Rename folder src"]').click());
+    act(() => mounted.container.querySelector('[aria-label="Delete folder src"]').click());
+    assert.deepEqual(renamed, [['file', 'src/main.js'], ['folder', 'src']]);
+    assert.deepEqual(deleted, ['src']);
+  } finally {
+    mounted.unmount();
+  }
 });
 
 test('command palette focuses search, filters files, opens a result, and closes from its controls', () => {
@@ -558,4 +586,33 @@ test('project tree folders expand and collapse, select a target folder, and open
   } finally {
     mounted.unmount();
   }
+});
+
+test('file deletion conflict preserves the active room and reports the backend conflict clearly', async () => {
+  let requestUrl = '';
+  const result = await requestFileDeletion({
+    backendHttpUrl: 'http://127.0.0.1:3001',
+    fileName: 'src/main.js',
+    clientId: '12345678-1234-1234-1234-123456789abc',
+    fetchImpl: async (url, options) => {
+      requestUrl = url;
+      assert.equal(options.method, 'DELETE');
+      return {
+        ok: false,
+        status: 409,
+        json: async () => ({
+          code: 'file_in_use',
+          error: 'This file is open in a collaboration session. Ask collaborators to close it, then retry.',
+        }),
+      };
+    },
+  });
+
+  assert.match(requestUrl, /src%2Fmain\.js\?clientId=12345678/);
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'file_in_use');
+  assert.match(result.message, /collaboration session/i);
+  assert.deepEqual(getFileDeletionTransition(result, 'src/main.js', 'src/main.js'), {
+    activeFile: 'src/main.js', closeActiveSession: false,
+  });
 });

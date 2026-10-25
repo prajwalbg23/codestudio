@@ -1,6 +1,7 @@
 // backend/mockMongoose.js
 const fs = require('fs');
 const path = require('path');
+const crypto = require('node:crypto');
 
 // Tests may redirect persistence to a temporary directory. Normal runs keep
 // using the backend directory unless this environment variable is set.
@@ -9,21 +10,49 @@ const dbPath = path.join(dataDir, 'db.json');
 
 function loadDB() {
   if (!fs.existsSync(dbPath)) {
-    fs.writeFileSync(dbPath, JSON.stringify({ files: [], members: [], folders: [] }, null, 2));
+    fs.writeFileSync(dbPath, JSON.stringify({ files: [], members: [], folders: [], filetombstones: [] }, null, 2));
   }
   try {
     const db = JSON.parse(fs.readFileSync(dbPath, 'utf8'));
-    for (const collection of ['files', 'members', 'folders']) {
+    for (const collection of ['files', 'members', 'folders', 'filetombstones']) {
       if (!Array.isArray(db[collection])) db[collection] = [];
     }
     return db;
   } catch (e) {
-    return { files: [], members: [], folders: [] };
+    return { files: [], members: [], folders: [], filetombstones: [] };
   }
 }
 
 function saveDB(data) {
   fs.writeFileSync(dbPath, JSON.stringify(data, null, 2));
+}
+
+function mutateDBAtomically(mutation, { beforeCommit } = {}) {
+  const snapshot = JSON.parse(JSON.stringify(loadDB()));
+  const result = mutation(snapshot);
+  if (result && typeof result.then === 'function') {
+    throw new Error('Atomic database mutations must be synchronous');
+  }
+  if (result?.commit === false) return result.value;
+
+  const tempPath = `${dbPath}.${crypto.randomUUID()}.tmp`;
+  const bytes = Buffer.from(JSON.stringify(snapshot, null, 2));
+  let fd;
+  try {
+    fd = fs.openSync(tempPath, 'wx');
+    fs.writeFileSync(fd, bytes);
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    fd = undefined;
+    beforeCommit?.();
+    // Same-directory replacement is atomic: readers observe the old or new
+    // complete JSON document, never a partially serialized project tree.
+    fs.renameSync(tempPath, dbPath);
+    return result?.value ?? result;
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+    if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
+  }
 }
 
 class Schema {
@@ -43,6 +72,13 @@ class MockModel {
     if (this._id) {
       const idx = db[collection].findIndex(item => item._id === this._id);
       if (idx !== -1) {
+        const immutableFields = this.constructor.immutableFields || [];
+        for (const field of immutableFields) {
+          const previousValue = db[collection][idx][field];
+          if (previousValue !== undefined && this[field] !== previousValue) {
+            throw new Error(`${field} is immutable`);
+          }
+        }
         db[collection][idx] = { ...this };
       } else {
         db[collection].push({ ...this });
@@ -61,6 +97,11 @@ function model(name, schema) {
 
   class ModelClass extends MockModel {
     static get collectionName() { return collectionName; }
+    static get immutableFields() {
+      return Object.entries(schema.definition || {})
+        .filter(([, options]) => options && options.immutable)
+        .map(([field]) => field);
+    }
 
     static async countDocuments() {
       const db = loadDB();
@@ -134,5 +175,6 @@ async function connect(uri) {
 module.exports = {
   Schema,
   model,
-  connect
+  connect,
+  mutateDBAtomically,
 };

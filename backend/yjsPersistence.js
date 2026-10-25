@@ -132,6 +132,24 @@ function createYjsPersistence({ Y, dataDir, onRoomUnavailable = () => {} }) {
   const yjsDir = path.join(dataDir, 'yjs_db');
   fs.mkdirSync(yjsDir, { recursive: true });
   const unavailableRooms = new Map();
+  const historyKeysByRoom = new Map();
+
+  function registerRoom(documentId, historyKey) {
+    if (typeof documentId !== 'string' || !documentId || typeof historyKey !== 'string' || !historyKey) {
+      throw historyError('document_identity_unavailable');
+    }
+    const existing = historyKeysByRoom.get(documentId);
+    if (existing !== undefined && existing !== historyKey) {
+      throw historyError('document_identity_conflict');
+    }
+    historyKeysByRoom.set(documentId, historyKey);
+  }
+
+  function historyKeyFor(documentId) {
+    const historyKey = historyKeysByRoom.get(documentId);
+    if (!historyKey) throw historyError('document_identity_unavailable');
+    return historyKey;
+  }
 
   function getPaths(docName) {
     const encodedName = encodeURIComponent(docName);
@@ -214,7 +232,8 @@ function createYjsPersistence({ Y, dataDir, onRoomUnavailable = () => {} }) {
 
     let updates;
     try {
-      updates = readUpdates(docName);
+      const historyKey = historyKeyFor(docName);
+      updates = readUpdates(historyKey);
       for (const update of updates) Y.applyUpdate(doc, update);
     } catch (error) {
       const reason = markUnavailable(docName, error, doc);
@@ -226,7 +245,7 @@ function createYjsPersistence({ Y, dataDir, onRoomUnavailable = () => {} }) {
     doc.on('update', update => {
       if (unavailableRooms.has(docName)) return;
       try {
-        appendUpdate(docName, update);
+        appendUpdate(historyKeyFor(docName), update);
       } catch (error) {
         markUnavailable(docName, error, doc);
       }
@@ -238,7 +257,7 @@ function createYjsPersistence({ Y, dataDir, onRoomUnavailable = () => {} }) {
   function readDocumentText(docName) {
     const doc = new Y.Doc();
     try {
-      const updates = readUpdates(docName);
+      const updates = readUpdates(historyKeyFor(docName));
       for (const update of updates) Y.applyUpdate(doc, update);
       return doc.getText('monaco').toString();
     } finally {
@@ -249,9 +268,10 @@ function createYjsPersistence({ Y, dataDir, onRoomUnavailable = () => {} }) {
   // Revision IDs identify an exact prefix of the append-only, validated log.
   // IDs are recomputed from disk, so restart recovery produces the same values.
   function readDocumentRevision(docName, requestedRevisionId) {
-    const updates = readUpdates(docName);
+    const historyKey = historyKeyFor(docName);
+    const updates = readUpdates(historyKey);
     const doc = new Y.Doc();
-    const revisionHasher = crypto.createHash('sha256').update(docName).update(Buffer.from([0])).update(YJS_LOG_MAGIC);
+    const revisionHasher = crypto.createHash('sha256').update(historyKey).update(Buffer.from([0])).update(YJS_LOG_MAGIC);
     let revision = null;
 
     try {
@@ -278,6 +298,7 @@ function createYjsPersistence({ Y, dataDir, onRoomUnavailable = () => {} }) {
       bindState,
       writeState: async () => {},
     },
+    registerRoom,
     getRoomError: docName => unavailableRooms.get(docName),
     readDocumentText,
     readDocumentRevision,
