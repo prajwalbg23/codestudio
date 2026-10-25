@@ -123,7 +123,14 @@ async function startServer() {
     cwd: dataDir,
     env: {
       ...process.env,
+      NODE_ENV: 'development',
+      CODESTUDIO_DEV_AUTH_BYPASS: 'true',
       PORT: String(port),
+      CODESTUDIO_BIND_HOST: '127.0.0.1',
+      CODESTUDIO_WORKSPACE_ID: 'reliability-test-workspace',
+      CODESTUDIO_BOOTSTRAP_ADMIN_USERNAME: '',
+      CODESTUDIO_BOOTSTRAP_ADMIN_PASSWORD: '',
+      CODESTUDIO_FRONTEND_ORIGINS: '',
       CODESTUDIO_DATA_DIR: dataDir,
       MONGODB_URI: '',
     },
@@ -616,6 +623,7 @@ test('file rename preserves identity, history, revisions, and keeps the renamed 
     type: 'rename',
     files: [{ documentId, oldPath, newPath, language: 'javascript' }],
     folders: [],
+    workspaceId: 'reliability-test-workspace',
   });
   projectEvents.close();
   const resolvedDocument = await request(`http://127.0.0.1:${port}/api/documents/${documentId}`);
@@ -787,6 +795,7 @@ test('empty-folder deletion publishes a project event and persists across backen
   assert.deepEqual(await deleted.json(), { message: 'Folder deleted successfully', folder: { path: folderPath } });
   assert.deepEqual(await projectEvents.event, {
     type: 'folder-deleted', folder: { path: folderPath },
+    workspaceId: 'reliability-test-workspace',
   });
   projectEvents.close();
 
@@ -864,7 +873,9 @@ test('renamed folder with only tombstoned files can be removed without losing re
 
   const deletedLeaf = await request(`http://127.0.0.1:${port}/api/folders/${encodeURIComponent(renamedLeaf)}`, { method: 'DELETE' });
   assert.equal(deletedLeaf.status, 200);
-  assert.deepEqual(await projectEvents.event, { type: 'folder-deleted', folder: { path: renamedLeaf } });
+  assert.deepEqual(await projectEvents.event, {
+    type: 'folder-deleted', folder: { path: renamedLeaf }, workspaceId: 'reliability-test-workspace',
+  });
   projectEvents.close();
   const deletedParent = await request(`http://127.0.0.1:${port}/api/folders/${encodeURIComponent(parent)}`, { method: 'DELETE' });
   assert.equal(deletedParent.status, 200, 'tombstones beneath the folder do not make it non-empty');
@@ -1063,8 +1074,8 @@ test('WebSocket upgrades accept configured dev and preview origins and reject ot
 
   assert.equal((await connect('http://127.0.0.1:5173')).status, 101);
   assert.equal((await connect('http://localhost:4173')).status, 101);
-  assert.equal((await connect('http://example.invalid')).status, 401);
-  assert.equal((await connect(undefined)).status, 401);
+  assert.equal((await connect('http://example.invalid')).status, 403);
+  assert.equal((await connect(undefined)).status, 403);
 });
 
 test('WebSocket room admission rejects unknown document IDs', async () => {

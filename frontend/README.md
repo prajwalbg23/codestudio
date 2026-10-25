@@ -4,7 +4,13 @@ The frontend is a local React application built with Vite. The backend runs sepa
 
 ## Run locally
 
-1. In a terminal, start the backend with `node server.js` from `backend`.
+1. In a terminal, set the explicit development-only identity and start the backend from `backend`:
+
+   ```powershell
+   $env:NODE_ENV = 'development'
+   $env:CODESTUDIO_DEV_AUTH_BYPASS = 'true'
+   node server.js
+   ```
 2. In a second terminal, run these commands from `frontend`:
 
    ```sh
@@ -14,7 +20,7 @@ The frontend is a local React application built with Vite. The backend runs sepa
 
 3. Open the local URL printed by Vite.
 
-The frontend connects to `http://127.0.0.1:3001` for HTTP and derives `ws://127.0.0.1:3001` for collaboration by default. To use a different local backend port, set the optional, non-secret Vite variable `VITE_BACKEND_URL` before starting Vite, for example:
+The frontend connects to `http://127.0.0.1:3001` for HTTP and derives `ws://127.0.0.1:3001` for collaboration by default. In the documented local development bypass mode, local requests use the explicit fixed developer identity. To use password authentication locally instead, configure both `CODESTUDIO_BOOTSTRAP_ADMIN_USERNAME` and `CODESTUDIO_BOOTSTRAP_ADMIN_PASSWORD` in the backend process and sign in through the app. To use a different local backend port, set the optional, non-secret Vite variable `VITE_BACKEND_URL` before starting Vite, for example:
 
 ```sh
 VITE_BACKEND_URL=http://127.0.0.1:3002 npm run dev
@@ -27,7 +33,7 @@ $env:VITE_BACKEND_URL = 'http://127.0.0.1:3002'
 npm run dev
 ```
 
-Use an `http://` endpoint on `localhost` or `127.0.0.1`; the WebSocket endpoint is derived as `ws://`. The backend binds only to IPv4 loopback. HTTP and WebSocket requests from browser pages are allowed only from Vite's default development origins (`http://localhost:5173` and `http://127.0.0.1:5173`) or preview origins (`http://localhost:4173` and `http://127.0.0.1:4173`). Vite reads the backend value at startup, so restart the dev server after changing it. Do not put secrets in frontend environment variables: Vite exposes `VITE_` values to browser code.
+Use an `http://` endpoint only on `localhost` or `127.0.0.1` for local development; its WebSocket endpoint is derived as `ws://`. An HTTPS backend origin is also accepted for future deployment configuration and derives `wss://`. The backend still refuses non-loopback binding. HTTP and WebSocket requests from development browser pages are allowed only from Vite's default origins (`http://localhost:5173`, `http://127.0.0.1:5173`, `http://localhost:4173`, and `http://127.0.0.1:4173`). Production origins are configured separately with `CODESTUDIO_FRONTEND_ORIGINS`; see the repository's `DEPLOYMENT.md`. Vite reads the backend value at startup/build time, so restart the dev server after changing it. Do not put secrets in frontend environment variables: Vite exposes `VITE_` values to browser code.
 
 ## Workspace controls
 

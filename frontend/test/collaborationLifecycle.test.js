@@ -10,7 +10,7 @@ import {
 import { getPresenceParticipants } from '../src/collaboratorPresence.js';
 
 function makeSession({ isCurrent = () => true, onUnavailable = () => {}, onDeleted = () => {}, onStatus = () => {}, onAwarenessChange = () => {} } = {}) {
-  const calls = { binding: 0, provider: 0, doc: 0, style: 0, awarenessNull: 0, unavailable: 0, deleted: 0, status: [] };
+  const calls = { binding: 0, provider: 0, doc: 0, style: 0, labels: 0, labelClear: 0, awarenessNull: 0, unavailable: 0, deleted: 0, status: [] };
   const provider = new EventEmitter();
   provider.awareness = new EventEmitter();
   provider.awareness.clientID = 1;
@@ -21,11 +21,16 @@ function makeSession({ isCurrent = () => true, onUnavailable = () => {}, onDelet
   const binding = { destroy: () => { calls.binding += 1; } };
   const ydoc = { destroy: () => { calls.doc += 1; } };
   const cursorStyle = { remove: () => { calls.style += 1; } };
+  const cursorLabels = {
+    clear: () => { calls.labelClear += 1; },
+    dispose: () => { calls.labels += 1; },
+  };
   const session = createCollaborationSession({
     provider,
     binding,
     ydoc,
     cursorStyle,
+    cursorLabels,
     isCurrent,
     onAwarenessChange,
     onUnavailable: () => { calls.unavailable += 1; onUnavailable(); },
@@ -67,7 +72,7 @@ test('explicit unavailable-room rejection immediately disposes every session res
 
   assert.equal(session.disposed, true);
   assert.deepEqual(calls, {
-    binding: 1, provider: 1, doc: 1, style: 1, awarenessNull: 1,
+    binding: 1, provider: 1, doc: 1, style: 1, labels: 1, labelClear: 0, awarenessNull: 1,
     unavailable: 1, deleted: 0, status: [],
   });
   assert.equal(provider.listenerCount('status'), 0);
@@ -83,7 +88,7 @@ test('the same teardown path releases the prior session on file switch and unmou
     session.dispose();
     assert.equal(session.disposed, true, lifecycleEnd);
     assert.deepEqual(calls, {
-      binding: 1, provider: 1, doc: 1, style: 1, awarenessNull: 1,
+      binding: 1, provider: 1, doc: 1, style: 1, labels: 1, labelClear: 0, awarenessNull: 1,
       unavailable: 0, deleted: 0, status: [],
     }, lifecycleEnd);
   }
@@ -99,6 +104,8 @@ test('repeated teardown is safe and does not destroy resources twice', () => {
   assert.equal(calls.provider, 1);
   assert.equal(calls.doc, 1);
   assert.equal(calls.style, 1);
+  assert.equal(calls.labels, 1);
+  assert.equal(calls.labelClear, 0);
   assert.equal(calls.awarenessNull, 1);
 });
 
@@ -136,6 +143,7 @@ test('generic WebSocket disconnection is not classified as unavailable history',
   provider.emit('status', { status: 'disconnected' });
   assert.equal(session.disposed, false);
   assert.equal(calls.unavailable, 0);
+  assert.equal(calls.labelClear, 1);
   assert.deepEqual(calls.status, [{ status: 'disconnected' }]);
   session.dispose();
 });

@@ -26,11 +26,14 @@ import CollaboratorPresence from './components/CollaboratorPresence.jsx';
 import ProjectTree from './components/ProjectTree.jsx';
 import EditorToolbar from './components/EditorToolbar.jsx';
 import OutputPanel from './components/OutputPanel.jsx';
+import AuthenticationScreen from './components/AuthenticationScreen.jsx';
 import { backendHttpUrl, backendWebSocketUrl } from './backendConfig.js';
+import { authenticatedFetch, clearAccessToken, setAccessToken } from './apiClient.js';
 import { createCollaborationSession, getRoomUiState } from './collaborationLifecycle.js';
 import { getFileDeletionTransition, requestFileDeletion } from './fileDeletion.js';
 import { buildRenamePath, getDocumentRename, getFolderDeletionTransition, remapExpandedFolders, remapProjectPath, requestProjectRename } from './projectRename.js';
 import { getPresenceParticipants, getVisiblePresenceParticipants } from './collaboratorPresence.js';
+import { createCollaboratorCursorLabels } from './collaboratorCursorLabels.js';
 import { buildProjectTree, filterProjectTree } from './projectTree.js';
 import { registerCodeSnippetProviders } from './codeSnippets.js';
 import { getSelectedFileLanguage, resolveFileLanguage } from './fileLanguage.js';
@@ -67,6 +70,7 @@ function App() {
   
   // States
   const [currentUser, setCurrentUser] = useState(null);
+  const [authLoading, setAuthLoading] = useState(true);
   const [members, setMembers] = useState([]);
   const [activeTab, setActiveTab] = useState('files');
   
@@ -104,8 +108,53 @@ function App() {
   const [editorText, setEditorText] = useState('');
   const [hashedEditorText, setHashedEditorText] = useState(null);
 
+  const acceptSession = useCallback(session => {
+    setAccessToken(session.token);
+    const user = session.user;
+    setCurrentUser({ _id: user.id, id: user.id, name: user.username, color: user.color || '#65a6ff', role: user.role, workspaceId: user.workspaceId });
+    setAuthLoading(false);
+  }, []);
+
+  const signOut = useCallback(async () => {
+    const request = authenticatedFetch(`${backendHttpUrl}/api/auth/logout`, { method: 'POST' });
+    clearAccessToken();
+    setCurrentUser(null);
+    setMembers([]);
+    setFileList([]);
+    setFolderList([]);
+    setActiveFile('');
+    try { await request; } catch { /* Local sign-out still clears the in-memory token. */ }
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch(`${backendHttpUrl}/api/auth/me`).then(async response => {
+      if (response.ok) {
+        const user = await response.json();
+        if (!cancelled) acceptSession({ token: null, user });
+      } else if (!cancelled) {
+        clearAccessToken();
+        setCurrentUser(null);
+        setAuthLoading(false);
+      }
+    }).catch(() => { if (!cancelled) setAuthLoading(false); });
+    return () => { cancelled = true; };
+  }, [acceptSession]);
+
+  useEffect(() => {
+    const onUnauthorized = () => {
+      clearAccessToken();
+      setCurrentUser(null);
+      setMembers([]);
+      setActiveFile('');
+    };
+    window.addEventListener('codestudio-auth-expired', onUnauthorized);
+    return () => window.removeEventListener('codestudio-auth-expired', onUnauthorized);
+  }, []);
+
   const providerRef = useRef(null);
   const bindingRef = useRef(null);
+  const monacoRef = useRef(null);
   const collaborationSessionRef = useRef(null);
   const roomClientIdRef = useRef(null);
   const handledDeletionPathsRef = useRef(new Set());
@@ -155,8 +204,8 @@ function App() {
     try {
       setFileLoadState('loading');
       const [res, foldersRes] = await Promise.all([
-        fetch(`${backendHttpUrl}/api/files`),
-        fetch(`${backendHttpUrl}/api/folders`),
+        authenticatedFetch(`${backendHttpUrl}/api/files`),
+        authenticatedFetch(`${backendHttpUrl}/api/folders`),
       ]);
       if (!res.ok || !foldersRes.ok) throw new Error('Project list request failed');
       const [files, folders] = await Promise.all([res.json(), foldersRes.json()]);
@@ -185,7 +234,7 @@ function App() {
   const fetchMembers = useCallback(async () => {
     try {
       setMemberLoadState('loading');
-      const res = await fetch(`${backendHttpUrl}/api/members`);
+      const res = await authenticatedFetch(`${backendHttpUrl}/api/members`);
       if (!res.ok) throw new Error('Team list request failed');
       const data = await res.json();
       if (!Array.isArray(data)) throw new Error('Invalid team list response');
@@ -199,9 +248,10 @@ function App() {
   }, [addOutput]);
 
   useEffect(() => {
+    if (!currentUser) return;
     fetchFiles();
     fetchMembers();
-  }, [fetchFiles, fetchMembers]);
+  }, [currentUser, fetchFiles, fetchMembers]);
 
   const applyProjectRename = useCallback(event => {
     if (!event || event.type !== 'rename') return;
@@ -271,7 +321,7 @@ function App() {
   const refreshDocumentPath = useCallback(async documentId => {
     if (!documentId) return;
     try {
-      const response = await fetch(`${backendHttpUrl}/api/documents/${encodeURIComponent(documentId)}`);
+      const response = await authenticatedFetch(`${backendHttpUrl}/api/documents/${encodeURIComponent(documentId)}`);
       if (!response.ok) return;
       const document = await response.json();
       const current = fileLanguageRef.current;
@@ -288,25 +338,42 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (typeof EventSource === 'undefined') return undefined;
-    const events = new EventSource(`${backendHttpUrl}/api/project-events`);
-    const onProjectChange = event => {
-      try {
-        applyProjectEvent(JSON.parse(event.data));
-      } catch {
-        // Ignore malformed event payloads and keep the existing project state.
+    if (!currentUser || typeof ReadableStream === 'undefined') return undefined;
+    let cancelled = false;
+    let controller;
+    const consumeEvents = async () => {
+      while (!cancelled) {
+        controller = new AbortController();
+        try {
+          const response = await authenticatedFetch(`${backendHttpUrl}/api/project-events`, { signal: controller.signal });
+          if (!response.ok || !response.body) throw new Error('Project event stream unavailable');
+          void fetchFiles();
+          void refreshDocumentPath(fileLanguageRef.current.documentId);
+          const reader = response.body.getReader();
+          let buffer = '';
+          while (!cancelled) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            buffer += new TextDecoder().decode(value, { stream: true });
+            const frames = buffer.split('\n\n');
+            buffer = frames.pop() || '';
+            for (const frame of frames) {
+              if (!frame.startsWith('event: project-change\n')) continue;
+              const data = frame.split('\n').find(line => line.startsWith('data: '))?.slice(6);
+              if (!data) continue;
+              try { applyProjectEvent(JSON.parse(data)); } catch { /* Ignore malformed event payloads. */ }
+            }
+          }
+          reader.releaseLock();
+        } catch {
+          if (cancelled) break;
+          await new Promise(resolve => window.setTimeout(resolve, 1000));
+        }
       }
     };
-    events.addEventListener('project-change', onProjectChange);
-    events.onopen = () => {
-      void fetchFiles();
-      void refreshDocumentPath(fileLanguageRef.current.documentId);
-    };
-    return () => {
-      events.removeEventListener('project-change', onProjectChange);
-      events.close();
-    };
-  }, [applyProjectEvent, fetchFiles, refreshDocumentPath]);
+    void consumeEvents();
+    return () => { cancelled = true; controller?.abort(); };
+  }, [currentUser, applyProjectEvent, fetchFiles, refreshDocumentPath]);
 
   useEffect(() => {
     if (!activeFile) {
@@ -326,7 +393,7 @@ function App() {
 
     const loadLanguage = async () => {
       try {
-        const response = await fetch(`${backendHttpUrl}/api/files/${encodeURIComponent(activeFile)}`);
+        const response = await authenticatedFetch(`${backendHttpUrl}/api/files/${encodeURIComponent(activeFile)}`);
         if (!response.ok) return;
         const metadata = await response.json();
         if (!cancelled) {
@@ -357,7 +424,7 @@ function App() {
     const fileName = activeFile;
     const refreshPersistedRevision = async () => {
       try {
-        const response = await fetch(`${backendHttpUrl}/api/documents/${encodeURIComponent(documentId)}/revisions/latest`);
+        const response = await authenticatedFetch(`${backendHttpUrl}/api/documents/${encodeURIComponent(documentId)}/revisions/latest`);
         if (!response.ok) return;
         const revision = await response.json();
         const currentModel = editorRef.current?.getModel();
@@ -385,7 +452,7 @@ function App() {
     if (!newFileName.trim()) return;
     const name = [selectedFolder, newFileName.trim()].filter(Boolean).join('/');
     try {
-      const res = await fetch(`${backendHttpUrl}/api/files`, {
+      const res = await authenticatedFetch(`${backendHttpUrl}/api/files`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name }),
@@ -415,7 +482,7 @@ function App() {
     if (!newFolderName.trim()) return;
     const folderPath = [selectedFolder, newFolderName.trim()].filter(Boolean).join('/');
     try {
-      const response = await fetch(`${backendHttpUrl}/api/folders`, {
+      const response = await authenticatedFetch(`${backendHttpUrl}/api/folders`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ path: folderPath }),
@@ -475,6 +542,7 @@ function App() {
       backendHttpUrl,
       fileName,
       clientId: roomClientId,
+        fetchImpl: authenticatedFetch,
     });
     if (result.ok) {
       applyDeletedFile(fileName, `Deleted ${fileName}.`, result);
@@ -488,7 +556,7 @@ function App() {
     event.stopPropagation();
     if (!confirm(`Delete empty folder ${folderPath}? Folders with live files or child folders cannot be deleted. Deleted-file history will be retained.`)) return;
     try {
-      const response = await fetch(`${backendHttpUrl}/api/folders/${encodeURIComponent(folderPath)}`, { method: 'DELETE' });
+      const response = await authenticatedFetch(`${backendHttpUrl}/api/folders/${encodeURIComponent(folderPath)}`, { method: 'DELETE' });
       if (!response.ok) {
         const message = await apiErrorMessage(response, 'Could not delete the folder.');
         setOperationNotice({ type: 'error', message });
@@ -533,6 +601,7 @@ function App() {
         kind: renameTarget.kind,
         oldPath: renameTarget.oldPath,
         newPath,
+        fetchImpl: authenticatedFetch,
       });
       const event = {
         type: 'rename',
@@ -565,7 +634,7 @@ function App() {
     e.preventDefault();
     if (!newMemberName.trim()) return;
     try {
-      const res = await fetch(`${backendHttpUrl}/api/members`, {
+      const res = await authenticatedFetch(`${backendHttpUrl}/api/members`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name: newMemberName.trim(), color: newMemberColor }),
@@ -591,7 +660,7 @@ function App() {
     e.stopPropagation();
     if (!confirm(`Remove this team member?`)) return;
     try {
-      const res = await fetch(`${backendHttpUrl}/api/members/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      const res = await authenticatedFetch(`${backendHttpUrl}/api/members/${encodeURIComponent(id)}`, { method: 'DELETE' });
       if (res.ok) {
         await fetchMembers();
         setOperationNotice({ type: 'success', message: 'Team member removed.' });
@@ -622,11 +691,24 @@ function App() {
       addOutput(`Opening collaboration session for ${sessionFile}.`, 'info', 'Collaboration');
       const ydoc = new Y.Doc();
       const clientId = window.crypto.randomUUID();
+      let provider;
+      let binding;
+      let session;
+      let disposed = false;
       roomClientIdRef.current = { file: sessionFile, documentId, clientId };
-      const provider = new WebsocketProvider(backendWebSocketUrl, documentId, ydoc, { params: { clientId } });
+      const initializeSession = async () => {
+      const ticketResponse = await authenticatedFetch(`${backendHttpUrl}/api/auth/websocket-ticket`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ documentId }),
+      });
+      if (!ticketResponse.ok) throw new Error('Could not authorize this collaboration room');
+      const { ticket } = await ticketResponse.json();
+      if (disposed) return;
+      provider = new WebsocketProvider(backendWebSocketUrl, documentId, ydoc, { params: { clientId, ticket } });
       const ytext = ydoc.getText('monaco');
       
-      const binding = new MonacoBinding(
+      binding = new MonacoBinding(
         ytext,
         editorRef.current.getModel(),
         new Set([editorRef.current]),
@@ -643,11 +725,19 @@ function App() {
       const cursorStyle = document.createElement('style');
       cursorStyle.dataset.codestudioRemoteCursors = 'true';
       document.head.appendChild(cursorStyle);
+      const cursorLabels = createCollaboratorCursorLabels({
+        editor: editorRef.current,
+        monaco: monacoRef.current,
+        awareness: provider.awareness,
+        ydoc,
+        ytext,
+      });
       const safeColor = color => /^#[\da-f]{6}$/i.test(color || '') ? color : '#8aa4c7';
       const onAwarenessChange = () => {
         const states = provider.awareness.getStates();
         const users = getPresenceParticipants(states, provider.awareness.clientID);
         setActiveUsers(users);
+        cursorLabels.update();
         cursorStyle.textContent = users
           .filter(user => !user.isCurrentSession && Number.isSafeInteger(user.clientId))
           .map(user => {
@@ -726,12 +816,12 @@ function App() {
         addOutput('WebSocket connection failed; CodeStudio will retry.', 'warning', 'Collaboration');
       };
 
-      let session;
       session = createCollaborationSession({
         provider,
         binding,
         ydoc,
         cursorStyle,
+        cursorLabels,
         isCurrent: () => collaborationSessionRef.current === session,
         onAwarenessChange,
         onStatus,
@@ -760,7 +850,23 @@ function App() {
       providerRef.current = provider;
       bindingRef.current = binding;
       onAwarenessChange();
-      return () => session.dispose();
+      };
+      void initializeSession().catch(() => {
+        if (disposed) return;
+        setActiveUsers([]);
+        setRoomState({ file: sessionFile, documentId, connection: 'disconnected', synced: false, initialSyncComplete: false, unavailable: false });
+        addOutput('Could not authorize the collaboration session. Sign in again or check workspace access.', 'error', 'Collaboration');
+      });
+      return () => {
+        disposed = true;
+        if (session) session.dispose();
+        else {
+          binding?.destroy();
+          provider?.destroy();
+          ydoc.destroy();
+          if (roomClientIdRef.current?.clientId === clientId) roomClientIdRef.current = null;
+        }
+      };
     }
 
     return undefined;
@@ -773,7 +879,7 @@ function App() {
     const requestBody = { ...searchOptions };
     if (canSearchEditorSnapshot) requestBody.excludeFileName = activeFile;
 
-    const response = await fetch(`${backendHttpUrl}/api/search`, {
+    const response = await authenticatedFetch(`${backendHttpUrl}/api/search`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(requestBody),
@@ -862,50 +968,8 @@ function App() {
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [paletteMode, mobileExplorerOpen, closePalette, openPalette]);
 
-  if (!currentUser) {
-    return (
-      <div className="App-container">
-        <main className="profile-screen">
-          <div className="profile-modal">
-            <div className="profile-brand"><FolderCode size={26} aria-hidden="true" /><span>CodeStudio</span></div>
-            <p className="profile-eyebrow">Collaborative coding</p>
-            <h1>Choose a profile label</h1>
-            <p className="profile-description">Your name and color identify you in shared editor sessions. Profiles are labels, not authenticated accounts.</p>
-            {operationNotice && <div className={`operation-notice ${operationNotice.type}`} role={operationNotice.type === 'error' ? 'alert' : 'status'}>{operationNotice.message}</div>}
-            
-            {memberLoadState === 'loading' ? (
-              <p role="status">Loading profile labels…</p>
-            ) : memberLoadState === 'error' ? (
-              <p role="alert" className="list-message error">Could not load profile labels. Check that the backend is running, then retry.</p>
-            ) : members.length > 0 ? (
-              <div className="profile-list">
-                {members.map(m => (
-                  <button key={m._id} className="profile-btn" onClick={() => setCurrentUser(m)}>
-                    <div className="profile-color-dot" style={{ color: m.color, backgroundColor: m.color }}></div>
-                    <span style={{ flexGrow: 1, textAlign: 'left' }}>{m.name}</span>
-                    <span className="profile-action">Use profile</span>
-                  </button>
-                ))}
-              </div>
-            ) : (
-              <p className="profile-empty">No profile labels yet. Create one to identify yourself in a shared session.</p>
-            )}
-
-            <div className="profile-create">
-              <h2>Create a profile label</h2>
-              <form className="input-group" onSubmit={handleCreateMember}>
-                <label className="visually-hidden" htmlFor="profile-color">Profile color</label>
-                <input id="profile-color" type="color" className="color-input" value={newMemberColor} onChange={(e) => setNewMemberColor(e.target.value)} />
-                <label className="visually-hidden" htmlFor="profile-name">Your name</label>
-                <input id="profile-name" type="text" className="text-input" placeholder="Your Name" value={newMemberName} onChange={(e) => setNewMemberName(e.target.value)} />
-                <button type="submit" className="action-btn" aria-label="Create profile label"><UserPlus size={18} /><span>Create profile</span></button>
-              </form>
-            </div>
-          </div>
-        </main>
-      </div>
-    );
-  }
+  if (authLoading) return <div className="auth-loading" role="status">Checking workspace access…</div>;
+  if (!currentUser) return <AuthenticationScreen backendHttpUrl={backendHttpUrl} onAuthenticated={acceptSession} />;
 
   const projectTree = filterProjectTree(buildProjectTree(fileList, folderList), fileSearch);
   const selectedLanguage = getSelectedFileLanguage(activeFile, fileLanguage);
@@ -966,10 +1030,11 @@ function App() {
           <span className="connection-label">{statusLabel}</span>
         </div>
         {roomUiState.showCollaborators && <CollaboratorPresence participants={visibleUsers} connectionStatus={currentRoomStatus} />}
-        <div className="profile-chip" title="Selected collaboration profile">
+        <div className="profile-chip" title={`Signed-in workspace account: ${currentUser.name}`}>
           <span className="profile-color-dot" style={{ backgroundColor: currentUser.color }} aria-hidden="true" />
           <span>{currentUser.name}</span>
         </div>
+        <button type="button" className="toolbar-action sign-out-action" onClick={() => void signOut()} title="Sign out of this workspace">Sign out</button>
         <div className="workspace-actions">
           <button type="button" className="toolbar-action" onClick={() => openPalette('files')} title="Open file (Ctrl/⌘ P)"><Search size={15} /> <span>Open file</span></button>
           <button type="button" className="toolbar-action" onClick={() => openPalette('content')} title="Find in active file (Ctrl/⌘ Shift F)"><Search size={15} /> <span>Find text</span></button>
@@ -1038,14 +1103,14 @@ function App() {
           </>
         ) : (
           <>
-            <p className="section-helper">Profile labels identify people in awareness and cursor presence. They are not accounts or workspace access.</p>
-            <form className="input-group" onSubmit={handleCreateMember}>
+            <p className="section-helper">Profile labels are optional workspace labels. Collaboration presence uses your signed-in account.</p>
+            {currentUser.role === 'admin' && <form className="input-group" onSubmit={handleCreateMember}>
               <label className="visually-hidden" htmlFor="member-color">Member color</label>
               <input id="member-color" type="color" className="color-input" value={newMemberColor} onChange={(e) => setNewMemberColor(e.target.value)} />
               <label className="visually-hidden" htmlFor="member-name">New member name</label>
-              <input id="member-name" type="text" className="text-input" placeholder="New Member" value={newMemberName} onChange={(e) => setNewMemberName(e.target.value)} />
+              <input id="member-name" type="text" className="text-input" placeholder="New profile label" value={newMemberName} onChange={(e) => setNewMemberName(e.target.value)} />
               <button type="submit" className="action-btn" aria-label="Create profile label"><UserPlus size={18} /><span>Add profile</span></button>
-            </form>
+            </form>}
             <ul className="item-list">
               {memberLoadState === 'loading' && <li className="list-message" role="status">Loading profile labels…</li>}
               {memberLoadState === 'error' && <li className="list-message error" role="alert">Could not load profile labels. Check that the backend is running, then retry.</li>}
@@ -1056,7 +1121,7 @@ function App() {
                     <div className="profile-color-dot" style={{ color: m.color, backgroundColor: m.color, width: 12, height: 12 }}></div>
                     <span>{m.name}</span>
                   </div>
-                  <button className="delete-btn" onClick={(e) => handleDeleteMember(e, m._id)} aria-label={`Remove ${m.name}`} title="Remove member"><Trash2 size={14} /></button>
+                  {currentUser.role === 'admin' && <button className="delete-btn" onClick={(e) => handleDeleteMember(e, m._id)} aria-label={`Remove ${m.name}`} title="Remove profile label"><Trash2 size={14} /></button>}
                 </li>
               ))}
             </ul>
@@ -1106,6 +1171,7 @@ function App() {
               }}
               onMount={(editor, monaco) => {
                 registerCodeSnippetProviders(monaco);
+                monacoRef.current = monaco;
                 editorRef.current = editor;
                 setEditorText(editor.getValue());
                 setIsEditorReady(true);

@@ -2,19 +2,23 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('node:crypto');
+const { resolveDataDirectory } = require('./storageConfiguration');
 
 // Tests may redirect persistence to a temporary directory. Normal runs keep
 // using the backend directory unless this environment variable is set.
-const dataDir = process.env.CODESTUDIO_DATA_DIR || __dirname;
+const dataDir = resolveDataDirectory(process.env, __dirname);
 const dbPath = path.join(dataDir, 'db.json');
 
 function loadDB() {
   if (!fs.existsSync(dbPath)) {
-    fs.writeFileSync(dbPath, JSON.stringify({ files: [], members: [], folders: [], filetombstones: [] }, null, 2));
+    fs.writeFileSync(dbPath, JSON.stringify({
+      files: [], members: [], folders: [], filetombstones: [], users: [],
+      workspacememberships: [], authsessions: [],
+    }, null, 2));
   }
   try {
     const db = JSON.parse(fs.readFileSync(dbPath, 'utf8'));
-    for (const collection of ['files', 'members', 'folders', 'filetombstones']) {
+    for (const collection of ['files', 'members', 'folders', 'filetombstones', 'users', 'workspacememberships', 'authsessions']) {
       if (!Array.isArray(db[collection])) db[collection] = [];
     }
     return db;

@@ -1,6 +1,13 @@
 // backend/server.js
 require('dotenv').config();
 
+const { resolveDataDirectory, validateProductionDataDirectory } = require('./storageConfiguration');
+const DATA_DIR = resolveDataDirectory(process.env, __dirname);
+if (process.env.NODE_ENV === 'production') validateProductionDataDirectory(DATA_DIR);
+// Resolve once so the JSON metadata store and Yjs histories share the exact
+// same root, including the unchanged backend-directory development default.
+process.env.CODESTUDIO_DATA_DIR = DATA_DIR;
+
 // Intercept mongoose imports to use mockMongoose instead
 const mockMongoose = require('./mockMongoose');
 require.cache[require.resolve('mongoose')] = {
@@ -20,15 +27,36 @@ const File = require('./models/File');
 const Folder = require('./models/Folder');
 const FileTombstone = require('./models/FileTombstone');
 const Member = require('./models/Member');
+const User = require('./models/User');
+const WorkspaceMembership = require('./models/WorkspaceMembership');
+const AuthSession = require('./models/AuthSession');
+const { createAuthenticationService, workspaceIdFromEnvironment } = require('./authentication');
 const { createYjsPersistence } = require('./yjsPersistence');
 const { searchText: searchProjectText, DEFAULT_RESULT_LIMIT } = require('./projectSearch');
-const { BACKEND_BIND_HOST, isAllowedFrontendOrigin } = require('./networkBoundary');
+const {
+  BACKEND_BIND_HOST,
+  BACKEND_PORT,
+  assertPublicBindDisabled,
+  isAllowedFrontendOrigin,
+} = require('./networkBoundary');
 const { isValidProjectPath, parentProjectPath, projectPathAncestors } = require('./projectPaths');
 const { renameFileMetadata, renameFolderMetadata, deleteEmptyFolderMetadata } = require('./projectTreeMutations');
+const WORKSPACE_ID = workspaceIdFromEnvironment();
+const authentication = createAuthenticationService({
+  User,
+  WorkspaceMembership,
+  AuthSession,
+  workspaceId: WORKSPACE_ID,
+  mutateDBAtomically: mockMongoose.mutateDBAtomically,
+});
+authentication.validateConfiguration(process.env);
 
+// Deployment-facing bind configuration remains loopback-only until the API,
+// event stream, and WebSocket admission all enforce authentication and access.
+assertPublicBindDisabled(BACKEND_BIND_HOST);
 
 const app = express();
-const PORT = process.env.PORT || 3001;
+const PORT = BACKEND_PORT;
 const EXECUTION_UNAVAILABLE_REASON = 'JavaScript execution is disabled because a verified local isolation runtime is unavailable.';
 let projectMutationQueue = Promise.resolve();
 let roomAdmissionPauseCount = 0;
@@ -36,14 +64,18 @@ const closingRooms = new Set();
 const closingDocumentIds = new Set();
 const roomConnections = new Map();
 const projectEventClients = new Set();
+const authenticatedConnections = new Set();
+const loginFailureBuckets = new Map();
+const LOGIN_FAILURE_LIMIT = 8;
+const LOGIN_FAILURE_WINDOW_MS = 15 * 60 * 1000;
 const FILE_DELETED_CLOSE_CODE = 1008;
 const FILE_DELETED_CLOSE_REASON = 'File deleted';
 const ROOM_CLOSING_CLOSE_CODE = 1013;
 const ROOM_CLOSING_CLOSE_REASON = 'File deletion in progress';
 
-function trackRoomConnection(roomName, socket, clientId) {
+function trackRoomConnection(roomName, socket, clientId, userId) {
   const connections = roomConnections.get(roomName) || new Set();
-  const connection = { socket, clientId };
+  const connection = { socket, clientId, userId };
   connections.add(connection);
   roomConnections.set(roomName, connections);
   socket.once('close', () => {
@@ -51,6 +83,33 @@ function trackRoomConnection(roomName, socket, clientId) {
     if (connections.size === 0) roomConnections.delete(roomName);
   });
   return connection;
+}
+
+function registerAuthenticatedConnection(identity, close) {
+  const record = { identity, close, timer: null };
+  authenticatedConnections.add(record);
+  if (Number.isFinite(identity.expiresAt)) {
+    const delay = Math.max(0, identity.expiresAt - Date.now());
+    record.timer = setTimeout(() => closeAuthenticatedRecord(record, 'Session expired'), delay);
+    record.timer.unref?.();
+  }
+  return () => {
+    if (record.timer) clearTimeout(record.timer);
+    authenticatedConnections.delete(record);
+  };
+}
+
+function closeAuthenticatedRecord(record, reason) {
+  try { record.close(reason); } catch { /* The peer may already be closing. */ }
+}
+
+function revokeAuthenticatedConnections({ userId, sessionTokenHash }, reason) {
+  for (const record of [...authenticatedConnections]) {
+    if ((userId && record.identity.userId === userId)
+      || (sessionTokenHash && record.identity.sessionTokenHash === sessionTokenHash)) {
+      closeAuthenticatedRecord(record, reason);
+    }
+  }
 }
 
 function queueProjectMutation(mutation) {
@@ -68,16 +127,18 @@ function queueRoomCoordinatedTreeMutation(mutation) {
 }
 
 function publishProjectEvent(event) {
-  const frame = `event: project-change\ndata: ${JSON.stringify(event)}\n\n`;
-  for (const response of projectEventClients) {
+  const frame = `event: project-change\ndata: ${JSON.stringify({ ...event, workspaceId: WORKSPACE_ID })}\n\n`;
+  for (const client of projectEventClients) {
+    const { response } = client;
+    if (client.workspaceId !== WORKSPACE_ID) continue;
     if (response.destroyed || response.writableEnded) {
-      projectEventClients.delete(response);
+      projectEventClients.delete(client);
       continue;
     }
     try {
       response.write(frame);
     } catch {
-      projectEventClients.delete(response);
+      projectEventClients.delete(client);
     }
   }
 }
@@ -167,8 +228,9 @@ function languageForExistingFile(file) {
   return getFileLanguage(file.name).language;
 }
 
-// Browsers can call the local API only from the project's default Vite dev/preview
-// origins. Requests without Origin remain available for local command-line tools.
+// Browsers can call the API only from its configured exact-origin allowlist.
+// Requests without Origin remain available for local command-line tools; this is
+// why origin validation is not an authentication mechanism.
 app.use((req, res, next) => {
   const origin = req.get('Origin');
   if (origin && !isAllowedFrontendOrigin(origin)) {
@@ -181,26 +243,119 @@ app.use(cors({
 }));
 app.use(express.json());
 
-// Connect to MongoDB
-mongoose.connect(process.env.MONGODB_URI)
-.then(async () => {
-  console.log('✅ Connected to MongoDB');
-  // Seed default files if db is empty
-  const count = await File.countDocuments();
-  if (count === 0) {
-    await File.insertMany([
-      { name: 'script.js', language: 'javascript', documentId: crypto.randomUUID(), historyKey: 'script.js' },
-      { name: 'style.css', language: 'css', documentId: crypto.randomUUID(), historyKey: 'style.css' },
-      { name: 'index.html', language: 'html', documentId: crypto.randomUUID(), historyKey: 'index.html' },
-    ]);
-    console.log('✅ Seeded default files');
+app.post('/api/auth/login', async (req, res) => {
+  const now = Date.now();
+  for (const [address, bucket] of loginFailureBuckets) {
+    if (bucket.until <= now) loginFailureBuckets.delete(address);
   }
-})
-.catch(err => console.error('❌ MongoDB connection error:', err));
+  const address = req.socket.remoteAddress || 'unknown';
+  const bucket = loginFailureBuckets.get(address);
+  if (bucket && bucket.count >= LOGIN_FAILURE_LIMIT && bucket.until > now) {
+    return res.status(429).json({ error: 'Too many sign-in attempts. Try again later.' });
+  }
+  try {
+    const result = await authentication.login(req.body?.username, req.body?.password);
+    if (!result) {
+      const current = loginFailureBuckets.get(address);
+      loginFailureBuckets.set(address, {
+        count: current && current.until > now ? current.count + 1 : 1,
+        until: current && current.until > now ? current.until : now + LOGIN_FAILURE_WINDOW_MS,
+      });
+      return res.status(401).json({ error: 'Invalid username or password' });
+    }
+    loginFailureBuckets.delete(address);
+    return res.json(result);
+  } catch {
+    return res.status(503).json({ error: 'Authentication is temporarily unavailable' });
+  }
+});
 
-// Tests may redirect persistence to the same isolated temporary directory
-// used by the JSON store. Normal runs keep using backend/yjs_db.
-const DATA_DIR = process.env.CODESTUDIO_DATA_DIR || __dirname;
+app.use('/api', async (req, res, next) => {
+  if (req.method === 'OPTIONS' || (req.method === 'POST' && req.path === '/auth/login')) return next();
+  try {
+    const authorization = req.get('Authorization') || '';
+    const match = /^Bearer ([A-Za-z0-9_-]{40,100})$/.exec(authorization);
+    const identity = await authentication.authenticate(match?.[1]);
+    if (!identity) return res.status(401).json({ error: 'Authentication required' });
+    req.auth = identity;
+    if (!authentication.identityForRequest(req)) {
+      return res.status(403).json({ error: 'Workspace access denied' });
+    }
+    return next();
+  } catch {
+    return res.status(503).json({ error: 'Authentication could not be verified' });
+  }
+});
+
+app.get('/api/auth/me', (req, res) => {
+  res.json({
+    id: req.auth.userId,
+    username: req.auth.username,
+    color: req.auth.color || '#65a6ff',
+    role: req.auth.role,
+    workspaceId: req.auth.workspaceId,
+  });
+});
+
+app.post('/api/auth/logout', async (req, res) => {
+  const token = /^Bearer (.+)$/.exec(req.get('Authorization') || '')?.[1];
+  await authentication.logout(token, () => {
+    if (!token) return;
+    const sessionTokenHash = crypto.createHash('sha256').update(token).digest('hex');
+    revokeAuthenticatedConnections({ sessionTokenHash }, 'Signed out');
+  });
+  res.json({ message: 'Signed out' });
+});
+
+app.post('/api/auth/users', async (req, res) => {
+  if (req.auth.role !== 'admin') return res.status(403).json({ error: 'Workspace administrator permission required' });
+  try {
+    const result = await authentication.createWorkspaceUser(req.body?.username, req.body?.password);
+    if (!result.ok) return res.status(result.error === 'Username already exists.' ? 409 : 400).json({ error: result.error });
+    return res.status(201).json({ user: result.user });
+  } catch {
+    return res.status(500).json({ error: 'Could not create workspace account' });
+  }
+});
+
+app.delete('/api/auth/users/:userId', async (req, res) => {
+  if (req.auth.role !== 'admin') return res.status(403).json({ error: 'Workspace administrator permission required' });
+  if (req.params.userId === req.auth.userId) return res.status(409).json({ error: 'Administrators cannot disable their own account' });
+  try {
+    const disabled = await authentication.disableWorkspaceUser(req.params.userId, () => {
+      revokeAuthenticatedConnections({ userId: req.params.userId }, 'Account disabled');
+    });
+    return disabled ? res.json({ message: 'Workspace account disabled' }) : res.status(404).json({ error: 'Workspace account not found' });
+  } catch {
+    return res.status(500).json({ error: 'Could not disable workspace account' });
+  }
+});
+
+app.post('/api/auth/websocket-ticket', async (req, res) => {
+  const { documentId } = req.body || {};
+  if (typeof documentId !== 'string' || !DOCUMENT_ID_PATTERN.test(documentId)) {
+    return res.status(400).json({ error: 'Invalid document identifier' });
+  }
+  try {
+    const file = await File.findOne({ documentId });
+    if (!file || await FileTombstone.findOne({ documentId }) || await FileTombstone.findOne({ path: file.name })) {
+      return res.status(404).json({ error: 'Document not found' });
+    }
+    await resolveFileIdentity(file);
+    const result = await authentication.issueWebSocketTicket(req.auth, documentId);
+    if (!result.ok) {
+      const status = result.reason === 'ticket_limit' ? 429 : 401;
+      const error = result.reason === 'ticket_limit'
+        ? 'Too many outstanding collaboration tickets. Close unused sessions and retry.'
+        : 'Authentication required';
+      return res.status(status).json({ error });
+    }
+    return res.json({ ticket: result.ticket });
+  } catch {
+    return res.status(503).json({ error: 'Document access could not be verified' });
+  }
+});
+
 const yjsPersistence = createYjsPersistence({
   Y,
   dataDir: DATA_DIR,
@@ -251,8 +406,13 @@ app.get('/api/project-events', (req, res) => {
   });
   res.flushHeaders();
   res.write(': connected\n\n');
-  projectEventClients.add(res);
-  res.on('close', () => projectEventClients.delete(res));
+  const client = { response: res, workspaceId: req.auth.workspaceId, userId: req.auth.userId };
+  client.releaseAuth = registerAuthenticatedConnection(req.auth, () => res.end());
+  projectEventClients.add(client);
+  res.on('close', () => {
+    projectEventClients.delete(client);
+    client.releaseAuth();
+  });
 });
 
 app.get('/api/execution-capability', (req, res) => {
@@ -610,7 +770,9 @@ app.delete('/api/files/:filename', async (req, res) => {
       closingDocumentIds.add(closingDocumentId);
 
       const connections = [...(roomConnections.get(file.documentId) || [])];
-      const requester = clientId ? connections.find(connection => connection.clientId === clientId) : null;
+      const requester = clientId
+        ? connections.find(connection => connection.clientId === clientId && connection.userId === req.auth.userId)
+        : connections.find(connection => connection.userId === req.auth.userId);
       const otherConnections = connections.filter(connection => connection !== requester);
       if (otherConnections.length > 0 || (connections.length > 0 && !requester)) {
         return res.status(409).json({
@@ -646,6 +808,7 @@ app.get('/api/members', async (req, res) => {
 });
 
 app.post('/api/members', async (req, res) => {
+  if (req.auth.role !== 'admin') return res.status(403).json({ error: 'Workspace administrator permission required' });
   try {
     const { name, color } = req.body;
     if (!name || !color) return res.status(400).json({ error: 'Name and color are required' });
@@ -661,6 +824,7 @@ app.post('/api/members', async (req, res) => {
 });
 
 app.delete('/api/members/:id', async (req, res) => {
+  if (req.auth.role !== 'admin') return res.status(403).json({ error: 'Workspace administrator permission required' });
   try {
     const deleted = await Member.findByIdAndDelete(req.params.id);
     if (!deleted) return res.status(404).json({ error: 'Member not found' });
@@ -673,11 +837,40 @@ app.delete('/api/members/:id', async (req, res) => {
 const server = http.createServer(app);
 const wss = new Server({
   server,
-  verifyClient: ({ origin }) => isAllowedFrontendOrigin(origin),
+  verifyClient: (info, callback) => {
+    if (!isAllowedFrontendOrigin(info.origin)) return callback(false, 403, 'Origin not allowed');
+    let documentId;
+    let ticket;
+    try {
+      const requestUrl = new URL(info.req.url, 'http://127.0.0.1');
+      documentId = requestUrl.pathname.slice(1);
+      ticket = requestUrl.searchParams.get('ticket');
+    } catch {
+      return callback(false, 400, 'Invalid WebSocket request');
+    }
+    const identity = authentication.devBypass
+      ? authentication.developmentPrincipal()
+      : authentication.consumeWebSocketTicket(ticket, documentId);
+    if (!identity || identity.workspaceId !== WORKSPACE_ID) {
+      return callback(false, 401, 'WebSocket authentication required');
+    }
+    void authentication.isIdentityActive(identity).then(active => {
+      if (!active) return callback(false, 401, 'WebSocket authentication required');
+      info.req.auth = identity;
+      return callback(true);
+    }).catch(() => callback(false, 503, 'WebSocket authorization unavailable'));
+  },
 });
 
 wss.on('connection', async (ws, req) => {
-  const documentId = req.url.slice(1).split('?')[0];
+  let requestUrl;
+  try {
+    requestUrl = new URL(req.url, 'http://127.0.0.1');
+  } catch {
+    ws.close(1008, 'Invalid document request');
+    return;
+  }
+  const documentId = requestUrl.pathname.slice(1);
   if (roomAdmissionPauseCount > 0) {
     ws.close(ROOM_CLOSING_CLOSE_CODE, 'Project metadata update in progress');
     return;
@@ -692,7 +885,7 @@ wss.on('connection', async (ws, req) => {
     return;
   }
 
-  const clientId = new URL(req.url, 'http://127.0.0.1').searchParams.get('clientId');
+  const clientId = requestUrl.searchParams.get('clientId');
   let file;
 
   try {
@@ -702,11 +895,14 @@ wss.on('connection', async (ws, req) => {
       return;
     }
     await resolveFileIdentity(file);
+    if (!req.auth || req.auth.workspaceId !== WORKSPACE_ID) {
+      ws.close(1008, 'Workspace access denied');
+      return;
+    }
     if (roomAdmissionPauseCount > 0 || closingRooms.has(file.name) || closingDocumentIds.has(documentId)) {
       ws.close(ROOM_CLOSING_CLOSE_CODE, ROOM_CLOSING_CLOSE_REASON);
       return;
     }
-    trackRoomConnection(documentId, ws, clientId);
     if (await FileTombstone.findOne({ documentId }) || await FileTombstone.findOne({ path: file.name })) {
       ws.close(FILE_DELETED_CLOSE_CODE, FILE_DELETED_CLOSE_REASON);
       return;
@@ -737,9 +933,57 @@ wss.on('connection', async (ws, req) => {
     return;
   }
 
-  setupWSConnection(ws, req);
+  try {
+    const admitted = await authentication.withActiveIdentity(req.auth, () => {
+      // This callback is synchronous and runs under the same lifecycle queue as
+      // logout and account disabling. Registration therefore happens wholly
+      // before revocation (which will close it) or wholly after it (which fails).
+      if (roomAdmissionPauseCount > 0 || closingRooms.has(file.name) || closingDocumentIds.has(documentId)) {
+        ws.close(ROOM_CLOSING_CLOSE_CODE, ROOM_CLOSING_CLOSE_REASON);
+        return false;
+      }
+      const connection = trackRoomConnection(documentId, ws, clientId, req.auth.userId);
+      connection.releaseAuth = registerAuthenticatedConnection(req.auth, reason => ws.close(1008, reason));
+      ws.once('close', () => connection.releaseAuth());
+      try {
+        setupWSConnection(ws, req);
+        return true;
+      } catch {
+        ws.close(1011, 'Room setup failed');
+        return false;
+      }
+    });
+    if (!admitted && ws.readyState === ws.OPEN) ws.close(1008, 'WebSocket authentication required');
+  } catch {
+    ws.close(1011, 'WebSocket authorization unavailable');
+  }
 });
 
-server.listen(PORT, BACKEND_BIND_HOST, () => {
-  console.log(`🚀 API & WebSocket Server is running at http://${BACKEND_BIND_HOST}:${PORT}`);
-});
+mongoose.connect(process.env.MONGODB_URI)
+  .then(async () => {
+    await authentication.initialize();
+    const count = await File.countDocuments();
+    if (count === 0) {
+      await File.insertMany([
+        { name: 'script.js', language: 'javascript', documentId: crypto.randomUUID(), historyKey: 'script.js' },
+        { name: 'style.css', language: 'css', documentId: crypto.randomUUID(), historyKey: 'style.css' },
+        { name: 'index.html', language: 'html', documentId: crypto.randomUUID(), historyKey: 'index.html' },
+      ]);
+      console.log('✅ Seeded default files');
+    }
+  })
+  .then(() => {
+    server.listen(PORT, BACKEND_BIND_HOST, () => {
+      console.log(`🚀 API & WebSocket Server is running at http://${BACKEND_BIND_HOST}:${PORT}`);
+    });
+  })
+  .catch(error => {
+    // Report the bootstrap conflict without logging configured usernames,
+    // passwords, database contents, or underlying storage errors.
+    if (error?.code === 'BOOTSTRAP_ADMIN_CONFLICT') {
+      console.error('Backend startup blocked: configured bootstrap administrator conflicts with an existing account.');
+    } else {
+      console.error('Backend startup blocked: storage or authentication configuration could not be initialized.');
+    }
+    process.exitCode = 1;
+  });

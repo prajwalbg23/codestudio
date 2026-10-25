@@ -34,6 +34,7 @@ export function createCollaborationSession({
   binding,
   ydoc,
   cursorStyle,
+  cursorLabels,
   isCurrent = () => true,
   onAwarenessChange,
   onStatus,
@@ -49,7 +50,10 @@ export function createCollaborationSession({
   };
 
   const awarenessChange = guard(onAwarenessChange);
-  const statusChange = guard(onStatus);
+  const statusChange = guard(status => {
+    if (status?.status === 'connecting' || status?.status === 'disconnected') cursorLabels?.clear();
+    onStatus?.(status);
+  });
   const syncChange = guard(onSync);
   const connectionError = guard(onConnectionError);
   const connectionClose = event => {
@@ -84,6 +88,7 @@ export function createCollaborationSession({
       () => binding.destroy(),
       () => provider.destroy(),
       () => ydoc.destroy(),
+      () => cursorLabels?.dispose(),
       () => cursorStyle.remove(),
       () => onDisposed?.(),
     ];
