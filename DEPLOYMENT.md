@@ -1,13 +1,14 @@
 # Deployment configuration and security status
 
-This document describes configuration needed for a future deployment. **The backend is still loopback-only and is not ready for public access.** Authentication and single-workspace authorization are implemented, but the backend deliberately refuses non-loopback binds until deployment-specific security review and verification are complete. Configuring an HTTPS frontend URL and production origins does not make public deployment safe.
+This document describes configuration for a future split deployment. Authentication and single-workspace authorization are implemented. The backend remains loopback-only by default; external binding requires the explicit, fail-closed production ingress gate described below. A successful startup check does not prove that a hosted deployment is secure or durable.
 
 ## Configuration
 
 | Variable | Purpose | Behavior |
 | --- | --- | --- |
 | `PORT` | Backend HTTP and WebSocket port assigned by a host | Defaults to `3001`; must be an integer from 1 through 65535. |
-| `CODESTUDIO_BIND_HOST` | Backend bind address | Defaults to `127.0.0.1`. The current backend rejects every non-loopback address. Authentication is implemented, but external ingress remains intentionally disabled and this setting cannot enable it. |
+| `CODESTUDIO_BIND_HOST` | Backend bind address | Defaults to `127.0.0.1`. Hosted Railway ingress requires `0.0.0.0` and the separate `CODESTUDIO_ENABLE_HOSTED_INGRESS=true` opt-in. A non-loopback bind is rejected unless every production security prerequisite is valid. |
+| `CODESTUDIO_ENABLE_HOSTED_INGRESS` | Explicit external-ingress opt-in | Unset or `false` preserves the loopback-only guard. `true` is accepted only with `NODE_ENV=production`, `CODESTUDIO_BIND_HOST=0.0.0.0`, valid bootstrap credentials, exact HTTPS frontend origins, usable absolute production storage, and the development bypass disabled. Do not set this until deployment-specific security review is complete. |
 | `CODESTUDIO_FRONTEND_ORIGINS` | Comma-separated production browser origins | Required when backend `NODE_ENV` is `production`. Use exact HTTPS origins only, without paths, credentials, or a wildcard, for example `https://studio.example.test`. Development mode explicitly allows Vite's default localhost origins on ports 5173 and 4173. |
 | `CODESTUDIO_WORKSPACE_ID` | Stable ID for this single-workspace instance | Defaults to `codestudio-default`; use the same value across restarts. The current storage model is one workspace per backend instance. |
 | `CODESTUDIO_BOOTSTRAP_ADMIN_USERNAME` | Initial administrator account name | Required with the password in production. On first startup, choose a unique unused username; it is created as the workspace administrator. |
@@ -20,7 +21,7 @@ This document describes configuration needed for a future deployment. **The back
 
 Use one backend instance with exclusive access to this data directory. Do not point multiple instances at an ephemeral per-instance disk or concurrently share the JSON store, and do not share it with unrelated CodeStudio instances. A writable directory is not proof of durability: the hosting provider must mount persistent storage at the configured path and preserve it across restarts and redeploys. Back up metadata and Yjs history together as a consistent set. If the provider only offers ephemeral storage or cannot guarantee a single writer, deployment requires a separately designed durable metadata/Yjs storage adapter and coordination layer; this phase does not replace either storage implementation.
 
-## Commands
+## Local commands
 
 With dependencies already installed, start the backend from `backend` with:
 
@@ -38,7 +39,40 @@ npm test
 npm run lint
 ```
 
-Set `VITE_BACKEND_URL` before running Vite or building the frontend. Set backend variables in the backend process environment. The project has no separate backend build or `start` script; its server entry point is `backend/server.js`.
+Set `VITE_BACKEND_URL` before running Vite or building the frontend. Set backend variables in the backend process environment. The project has no separate backend build or `start` script; its server entry point is `backend/server.js`. `npm run preview` is for local preview and is not a configured production static server.
+
+## Proposed split Railway services
+
+This repository has separate frontend and backend package roots, so configure two services from the same GitHub repository and `main` branch:
+
+### Backend service
+
+- Root directory: `backend`
+- Install/build command: `npm ci` (there is no backend build step)
+- Start command: `node server.js`
+- Runtime port: use Railway's injected `PORT`; do not hardcode a public port.
+- Attach one persistent volume to this service at `/data` and set `CODESTUDIO_DATA_DIR=/data`.
+- Keep exactly one backend instance as the exclusive writer for the JSON store and Yjs histories.
+- Set `NODE_ENV=production`, `CODESTUDIO_FRONTEND_ORIGINS` to the exact HTTPS origin generated for the frontend, `CODESTUDIO_BOOTSTRAP_ADMIN_USERNAME`, and `CODESTUDIO_BOOTSTRAP_ADMIN_PASSWORD` as a protected Railway variable. Keep the same bootstrap values across restarts; they do not rotate an existing password.
+- Set `CODESTUDIO_BIND_HOST=0.0.0.0` and `CODESTUDIO_ENABLE_HOSTED_INGRESS=true` only after reviewing and accepting the deployment security boundary. Without both values and all other validated production settings, hosted binding fails closed. `CODESTUDIO_DEV_AUTH_BYPASS` must be unset or false.
+- `CODESTUDIO_WORKSPACE_ID` is optional but should be set to a stable value if not using the default.
+
+The production storage check requires the mounted `/data` directory to exist and be usable before startup. It writes `db.json` and `yjs_db/` below that same mount. Railway documents volumes as mounted at service runtime; do not run application data initialization in the build phase. The application cannot confirm that a provider preserves the volume through every operational event. Back up `db.json` and `yjs_db/` together, and test restore procedures before relying on the deployment.
+
+### Frontend service
+
+- Root directory: `frontend`
+- Builder: repository `frontend/Dockerfile` (Railway detects it from the service root directory)
+- Build steps: the Dockerfile runs `npm ci`, validates the required backend URL, then runs `npm run build`; Vite outputs `dist`
+- Start command: Dockerfile `CMD` runs Caddy with `frontend/Caddyfile`; no Railway Start Command override is needed
+- Build variable: `VITE_BACKEND_URL=https://<backend-public-host>`; the frontend derives `wss://` for Yjs connections. Vite embeds this non-secret value into the browser bundle, so rebuild after changing it.
+- Configure the backend's `CODESTUDIO_FRONTEND_ORIGINS` with the exact HTTPS frontend origin, with no path or wildcard.
+
+The frontend includes a multi-stage `frontend/Dockerfile` that runs `npm ci`, validates the backend URL, builds with Vite, and copies `dist` into the official Caddy image. `frontend/Caddyfile` serves the generated files on Railway's runtime `PORT` and falls back to `index.html` for client-side routes. Set the Railway service root directory to `frontend` so Railway detects this Dockerfile. The Docker build declares `ARG VITE_BACKEND_URL`; set that service variable to the backend HTTPS origin. The build fails closed if it is missing, non-HTTPS, or contains a path, query, or credentials. The Caddy container serves static content only; it does not proxy API or WebSocket traffic.
+
+Railway build variables must be declared as Docker build arguments to be available inside a Dockerfile build. Vite embeds `VITE_BACKEND_URL` in the static bundle, so changing the backend domain requires rebuilding and redeploying the frontend. Do not set secrets on the frontend service or use `VITE_` variables for credentials.
+
+Do not scale multiple backend instances or attach the same JSON/Yjs data directory to unrelated services. Railway volume persistence, filesystem semantics, backup cadence, and restore behavior must be verified for the chosen plan. Local tests cannot prove Railway persistence, hosted TLS, or multi-device collaboration behavior.
 
 ## Security assessment and deployment gate
 
@@ -60,6 +94,6 @@ The explicit local bypass is available only when `CODESTUDIO_DEV_AUTH_BYPASS=tru
 
 ## Remaining deployment gate
 
-This is a single-workspace, single-backend-instance authentication layer; it is not a multi-tenant workspace service. Password reset, MFA, invitation delivery, persistent login throttling across restarts, and automated backup/restore are not implemented. Awareness names and colors are presentation data supplied by connected clients; they do not grant permissions and must not be treated as verified identity. Serve production traffic through HTTPS/WSS at a trusted TLS-terminating host, protect bootstrap credentials, back up the data volume, and complete deployment-specific security review before use with public users.
+This is a single-workspace, single-backend-instance authentication layer; it is not a multi-tenant workspace service. Password reset, MFA, invitation delivery, persistent login throttling across restarts, and automated backup/restore are not implemented. Awareness names and colors are presentation data supplied by connected clients; they do not grant permissions and must not be treated as verified identity. Serve traffic through HTTPS/WSS at a trusted TLS-terminating host, protect bootstrap credentials, back up the data volume, and complete deployment-specific security review before use with public users.
 
-The server still calls `assertPublicBindDisabled` before creating its listener. Every non-loopback bind remains blocked, regardless of authentication settings; this milestone does not provide a private-ingress exception. A normal hosted ingress cannot reach the backend while it listens only on loopback unless a specifically designed same-host private proxy can do so. These startup and storage checks do not make the application deployment-ready or production-secure. Do not deploy this backend publicly in the current state.
+The public-ingress opt-in only changes the bind guard; it does not bypass authentication, workspace authorization, authenticated SSE checks, WebSocket ticket validation, or Origin checks. It is not an authentication mechanism. Review those controls, Railway ingress and logging behavior, operational access, backups, and restore procedures before enabling the flag. Tests and startup validation do not establish production security, hosted persistence, or multi-device reliability. Do not enable public ingress or deploy until those checks are complete.

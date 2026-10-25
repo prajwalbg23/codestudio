@@ -1,4 +1,6 @@
 const net = require('node:net');
+const { validateAuthenticationConfiguration } = require('./authentication');
+const { resolveDataDirectory, validateProductionDataDirectory } = require('./storageConfiguration');
 
 const DEFAULT_BACKEND_BIND_HOST = '127.0.0.1';
 const DEFAULT_BACKEND_PORT = 3001;
@@ -37,10 +39,43 @@ function isLoopbackBindHost(host) {
   return firstOctet === 127;
 }
 
-function assertPublicBindDisabled(host) {
-  if (!isLoopbackBindHost(host)) {
-    throw new Error('Public backend binding remains disabled pending an explicit network-boundary change and deployment review.');
+function assertBackendBindAllowed(host, env = process.env) {
+  const ingress = env.CODESTUDIO_ENABLE_HOSTED_INGRESS;
+  if (ingress !== undefined && ingress !== 'true' && ingress !== 'false') {
+    throw new Error('CODESTUDIO_ENABLE_HOSTED_INGRESS must be either true or false.');
   }
+
+  if (ingress !== 'true') {
+    if (!isLoopbackBindHost(host)) {
+      throw new Error('Public backend binding remains disabled unless production hosted ingress is explicitly enabled and validated.');
+    }
+    return false;
+  }
+
+  if (env.NODE_ENV !== 'production' || host !== '0.0.0.0') {
+    throw new Error('Hosted ingress requires NODE_ENV=production and CODESTUDIO_BIND_HOST=0.0.0.0.');
+  }
+  if (resolveBackendBindHost(env) !== host) {
+    throw new Error('Hosted ingress requires CODESTUDIO_BIND_HOST to match the server bind address.');
+  }
+
+  const authentication = validateAuthenticationConfiguration(env);
+  if (authentication.devBypass) {
+    throw new Error('Hosted ingress cannot be enabled with the development authentication bypass.');
+  }
+
+  const origins = resolveAllowedFrontendOrigins(env);
+  if (origins.size === 0) {
+    throw new Error('Hosted ingress requires at least one exact HTTPS frontend origin.');
+  }
+
+  const dataDirectory = resolveDataDirectory(env, __dirname);
+  validateProductionDataDirectory(dataDirectory);
+  return true;
+}
+
+function assertPublicBindDisabled(host, env = process.env) {
+  return assertBackendBindAllowed(host, env);
 }
 
 function parseProductionFrontendOrigins(value) {
@@ -99,6 +134,7 @@ module.exports = {
   BACKEND_BIND_HOST,
   BACKEND_PORT,
   ALLOWED_FRONTEND_ORIGINS,
+  assertBackendBindAllowed,
   assertPublicBindDisabled,
   isAllowedFrontendOrigin,
   isLoopbackBindHost,

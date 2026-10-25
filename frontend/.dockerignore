@@ -1,0 +1,12 @@
+.env*
+**/.env*
+.git
+**/.git
+node_modules
+**/node_modules
+dist
+**/dist
+*.local
+**/*.local
+*.log
+**/*.log
